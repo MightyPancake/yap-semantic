@@ -53,20 +53,15 @@ yap_ctx* yap_build(yap_ctx* ctx, yap_args args){
      * own source_node from parsing.  Collect declarations from all into the
      * current module. */
     for_darr(i, imp, ctx->root_source->imports){
+        //We skip modules for now...
         if (imp.kind != yap_import_file) continue;
-        yap_source* child = NULL;
-        for_darr(j, src, ctx->sources){
-            if (src->identity && imp.identity &&
-                strcmp(src->identity, imp.identity) == 0){
-                child = src;
-                break;
-            }
+
+        yap_source* src = find_source_by_identity(ctx, imp.identity);
+        if (!src){
+            yap_log("Failed to find source for import '%s'", imp.identity);
+            continue;
         }
-        if (!child || !child->source_node) continue;
-
-        yap_source_node* snode = child->source_node;
-        yap_source*      src   = child;
-
+        yap_source_node* snode = src->source_node;
         /* Pass 1 – register top-level signatures for mutual recursion */
         for_darr(j, dnode, snode->declarations){
             yap_build_top_level_declaration(src, &dnode);
@@ -75,7 +70,7 @@ yap_ctx* yap_build(yap_ctx* ctx, yap_args args){
         /* Pass 2 – build full declarations */
         for_darr(j, dnode, snode->declarations){
             yap_decl decl = yap_build_decl(src, &dnode);
-            yap_log("Pass 2: built declaration kind=%d", decl.kind);
+            yap_log("Pass 2: built declaration kind=%d", decl.kind);\
             if (ctx->current_module){
                 darr_push(ctx->current_module->semantic_decls, decl);
             }
