@@ -35,6 +35,45 @@ static void yap_build_push_error(yap_source* src, yap_loc loc, const char* fmt, 
 }
 
 /*
+ * Recursive post-order build: leaves first, deduplicated by origin.
+ */
+static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(char*) visited_origins){
+    if (!src || !src->source_node) return;
+
+    // Skip if already visited (by origin)
+    if (src->origin){
+        for_darr(i, vo, visited_origins){
+            if (strcmp(vo, src->origin) == 0) return;
+        }
+        darr_push(visited_origins, src->origin);
+    }
+
+    // Recurse into file-import children first (leaves before parents)
+    for_darr(i, imp, src->imports){
+        if (imp.kind != yap_import_file) continue;
+        yap_source* child = find_source_by_identity(ctx, imp.identity);
+        if (child)
+            yap_build_source_postorder(ctx, child, visited_origins);
+    }
+
+    // Now build this source's own declarations
+    yap_source_node* snode = src->source_node;
+    yap_log("Building source: %s (%d declarations)", src->identity, darr_len(snode->declarations));
+
+    /* Pass 1 – register top-level signatures for mutual recursion */
+    for_darr(j, dnode, snode->declarations){
+        yap_build_top_level_declaration(src, &dnode);
+    }
+
+    /* Pass 2 – build full declarations */
+    for_darr(j, dnode, snode->declarations){
+        yap_decl decl = yap_build_decl(src, &dnode);
+        yap_log("Pass 2: built declaration kind=%d", decl.kind);
+        darr_push(ctx->semantic_decls, decl);
+    }
+}
+
+/*
  * Top-level entry point.
  */
 yap_ctx* yap_build(yap_ctx* ctx, yap_args args){
@@ -49,33 +88,19 @@ yap_ctx* yap_build(yap_ctx* ctx, yap_args args){
         return ctx;
     }
 
-    /* Iterate over root's file imports (children).  Each file source has its
-     * own source_node from parsing.  Collect declarations from all into the
-     * current module. */
+    /* Walk the source tree post-order: deepest imports first,
+     * deduplicating by origin so each source file is built once. */
+    darr(char*) visited_origins = darr_new(char*);
     for_darr(i, imp, ctx->root_source->imports){
-        //We skip modules for now...
         if (imp.kind != yap_import_file) continue;
-
         yap_source* src = find_source_by_identity(ctx, imp.identity);
         if (!src){
             yap_log("Failed to find source for import '%s'", imp.identity);
             continue;
         }
-        yap_source_node* snode = src->source_node;
-        /* Pass 1 – register top-level signatures for mutual recursion */
-        for_darr(j, dnode, snode->declarations){
-            yap_build_top_level_declaration(src, &dnode);
-        }
-
-        /* Pass 2 – build full declarations */
-        for_darr(j, dnode, snode->declarations){
-            yap_decl decl = yap_build_decl(src, &dnode);
-            yap_log("Pass 2: built declaration kind=%d", decl.kind);\
-            if (ctx->current_module){
-                darr_push(ctx->current_module->semantic_decls, decl);
-            }
-        }
+        yap_build_source_postorder(ctx, src, visited_origins);
     }
+    darr_free(visited_origins);
 
     return ctx;
 }
