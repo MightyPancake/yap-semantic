@@ -3,7 +3,7 @@
 
 #include "utils/utils.h"
 #define YAP_LOG_TAG "Y-SEM"
-#define YAP_LOG_TAG_COLOR aesc_magenta
+#define YAP_LOG_TAG_COLOR aesc_green
 #define YAP_LOG_MSG_COLOR aesc_white
 
 #include "yap/all.h"
