@@ -389,6 +389,17 @@ yap_statement yap_build_var_decl_statement(yap_source* src, yap_var_decl_node* v
             init = yap_build_expr(src, &vnode->init);
             if (init.kind == yap_expr_error)
                 return (yap_statement){ .kind = yap_statement_error };
+            // Check that the initializer is assignable to the declared type
+            if (!yap_ctx_type_id_assignable(ctx, declared_type, init.type)){
+                char* rhs_str = yap_ctx_type_id_to_string(ctx, init.type);
+                char* lhs_str = yap_ctx_type_id_to_string(ctx, declared_type);
+                yap_build_push_error(src, vnode->loc,
+                    "Cannot initialize variable of type '%s' with value of type '%s'",
+                    lhs_str, rhs_str);
+                free(rhs_str);
+                free(lhs_str);
+                return (yap_statement){ .kind = yap_statement_error };
+            }
         }
     } else if (vnode->has_init){
         init = yap_build_expr(src, &vnode->init);
@@ -596,10 +607,13 @@ yap_expr yap_build_literal_expr(yap_source* src, yap_literal_node* lit){
     yap_expr res = { .kind = yap_expr_literal, .is_comptime = true, .is_lvalue = false };
 
     switch (lit->kind){
-        case yap_literal_numerical:
-            res.type = ctx->untyped_int_type_id;
+        case yap_literal_numerical: {
+            // Detect float literals (contain a '.') vs integer literals
+            bool is_float = strchr(lit->numerical, '.') != NULL;
+            res.type = is_float ? ctx->untyped_float_type_id : ctx->untyped_int_type_id;
             res.literal = (yap_literal){ .kind = yap_literal_numerical, .text = lit->numerical };
             break;
+        }
         case yap_literal_string:
             res.type = ctx->blob_type_id;
             res.literal = (yap_literal){ .kind = yap_literal_string, .text = lit->string.value };
@@ -686,6 +700,19 @@ yap_expr yap_build_assignment_expr(yap_source* src, yap_assignment_node* assign)
     yap_type* left_type = yap_ctx_get_type(ctx, left.type);
     if (left_type && left_type->is_const){
         yap_build_push_error(src, assign->loc, "Cannot assign to a const value");
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    // Type assignability check: right-hand side must be assignable to left.
+    // Uses yap_ctx_type_id_assignable which coerces untyped types before comparison.
+    if (!yap_ctx_type_id_assignable(ctx, left.type, right.type)){
+        char* rhs_str = yap_ctx_type_id_to_string(ctx, right.type);
+        char* lhs_str = yap_ctx_type_id_to_string(ctx, left.type);
+        yap_build_push_error(src, assign->loc,
+            "Cannot assign value of type '%s' to variable of type '%s'",
+            rhs_str, lhs_str);
+        free(rhs_str);
+        free(lhs_str);
         return (yap_expr){ .kind = yap_expr_error };
     }
 
