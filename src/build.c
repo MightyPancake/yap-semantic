@@ -58,6 +58,8 @@ static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(char*
 
     // Now build this source's own declarations
     yap_source_node* snode = src->source_node;
+    if (snode->was_built) return;
+    snode->was_built = true;
     yap_log("Building source: %s (%d declarations)", src->identity, darr_len(snode->declarations));
 
     /* Pass 1 – register top-level signatures for mutual recursion */
@@ -70,6 +72,8 @@ static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(char*
         yap_decl decl = yap_build_decl(src, &dnode);
         yap_log("Pass 2: built declaration kind=%d", decl.kind);
         darr_push(ctx->semantic_decls, decl);
+        if (ctx->gen_decl)
+            ctx->gen_decl(ctx, decl);
     }
 }
 
@@ -78,7 +82,7 @@ static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(char*
  */
 yap_ctx* yap_build(yap_ctx* ctx, yap_args args){
     (void)args;
-    yap_log("\n\nPhase X: Semantic analysis (build)\n");
+    yap_log("\n\nBuild phase\n");
 
     if (!ctx->root_source){
         yap_ctx_push_error(ctx, (yap_error){
