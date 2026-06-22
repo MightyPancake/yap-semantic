@@ -626,6 +626,10 @@ yap_expr yap_build_literal_expr(yap_source* src, yap_literal_node* lit){
             res.type = ctx->bool_type_id;
             res.literal = (yap_literal){ .kind = yap_literal_bool, .text = lit->numerical };
             break;
+        case yap_literal_null:
+            res.type = ctx->void_type_id;  // null is a void pointer-like value
+            res.literal = (yap_literal){ .kind = yap_literal_null, .text = "0" };
+            break;
         default:
             yap_build_push_error(src, lit->loc, "Unhandled literal kind");
             return (yap_expr){ .kind = yap_expr_error };
@@ -947,10 +951,6 @@ yap_expr yap_build_member_access_expr(yap_source* src, yap_member_access_node* m
     };
 }
 
-/* ----------------------------------------------------------------
- *  Type building from node — recursive using yap_type_node
- * ---------------------------------------------------------------- */
-
 yap_type_id yap_build_type_from_type_node(yap_source* src, yap_type_node* tnode){
     yap_ctx* ctx = src->ctx;
     if (!tnode) return 0;
@@ -1114,9 +1114,13 @@ yap_func_arg yap_build_func_arg(yap_source* src, yap_func_arg_node* anode){
 yap_struct_field yap_build_struct_field(yap_source* src, yap_var_decl_node* vn){
     yap_ctx* ctx = src->ctx;
 
+    // Nameless fields: anonymous structs/unions embed their members (C11-style).
+    // Nameless enums are illegal — they declare nothing in C.
     if (!vn->name.value){
-        yap_build_push_error(src, vn->loc, "Missing field name");
-        return (yap_struct_field){ .kind = yap_struct_field_error };
+        if (!vn->has_type || !vn->type_node){
+            yap_build_push_error(src, vn->loc, "Missing field name");
+            return (yap_struct_field){ .kind = yap_struct_field_error };
+        }
     }
 
     yap_type_id type = ctx->internal_error_type_id;
