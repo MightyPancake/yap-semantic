@@ -676,6 +676,7 @@ yap_expr yap_build_expr(yap_source* src, yap_expr_node* node){
         case yap_expr_decrement:     ret = yap_build_decrement_expr(src, node->decrement.expr); break;
         case yap_expr_ternary:       ret = yap_build_ternary_expr(src, &node->ternary);         break;
         case yap_expr_member_access: ret = yap_build_member_access_expr(src, &node->member_access); break;
+        case yap_expr_index_access:  ret = yap_build_index_access_expr(src, &node->index_access);  break;
         default:
             yap_build_push_error(src, node->loc, "Unhandled expression kind");
             break;
@@ -697,10 +698,19 @@ yap_expr yap_build_literal_expr(yap_source* src, yap_literal_node* lit){
             res.literal = (yap_literal){ .kind = yap_literal_numerical, .text = lit->numerical };
             break;
         }
-        case yap_literal_string:
-            res.type = ctx->blob_type_id;
+        case yap_literal_string: {
+            yap_type_id byte_id = yap_ctx_get_type_id_by_name(ctx, "byte");
+            yap_type slice_t = { .kind = yap_type_slice, .slice = { .element_type = byte_id }, .is_const = false };
+            res.type = yap_ctx_insert_type_if_not_exists(ctx, slice_t);
             res.literal = (yap_literal){ .kind = yap_literal_string, .text = lit->string.value };
             break;
+        }
+        case yap_literal_cstring: {
+            yap_type_id byte_id = yap_ctx_get_type_id_by_name(ctx, "byte");
+            res.type = yap_ctx_get_pointer_of_type_id(ctx, byte_id);
+            res.literal = (yap_literal){ .kind = yap_literal_cstring, .text = lit->string.value };
+            break;
+        }
         case yap_literal_bool:
             res.type = ctx->bool_type_id;
             res.literal = (yap_literal){ .kind = yap_literal_bool, .text = lit->numerical };
@@ -1030,6 +1040,45 @@ yap_expr yap_build_member_access_expr(yap_source* src, yap_member_access_node* m
     };
 }
 
+yap_expr yap_build_index_access_expr(yap_source* src, yap_index_access_node* ia){
+    yap_ctx* ctx = src->ctx;
+
+    yap_expr object = yap_build_expr(src, ia->object);
+    if (object.kind == yap_expr_error) return (yap_expr){ .kind = yap_expr_error };
+
+    yap_expr index = yap_build_expr(src, ia->index);
+    if (index.kind == yap_expr_error) return (yap_expr){ .kind = yap_expr_error };
+
+    yap_type* obj_type = yap_ctx_get_type(ctx, object.type);
+    if (!obj_type){
+        yap_build_push_error(src, ia->loc, "Invalid type in index access");
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    yap_type_id element_type = 0;
+    if (obj_type->kind == yap_type_array)
+        element_type = obj_type->array.element_type;
+    else if (obj_type->kind == yap_type_slice)
+        element_type = obj_type->slice.element_type;
+    else if (obj_type->kind == yap_type_ptr)
+        element_type = obj_type->pointer_type;
+    else {
+        yap_build_push_error(src, ia->loc, "Index access requires array, slice, or pointer type");
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    return (yap_expr){
+        .kind          = yap_expr_index_access,
+        .index_access  = (yap_index_access){
+            .object = yap_ctx_one_cpy(ctx, object),
+            .index  = yap_ctx_one_cpy(ctx, index)
+        },
+        .type        = element_type,
+        .is_lvalue   = true,
+        .is_comptime = false
+    };
+}
+
 yap_type_id yap_build_type_from_type_node(yap_source* src, yap_type_node* tnode){
     yap_ctx* ctx = src->ctx;
     if (!tnode) return 0;
@@ -1132,6 +1181,36 @@ yap_type_id yap_build_type_from_type_node(yap_source* src, yap_type_node* tnode)
             yap_type t = {
                 .kind = yap_type_union,
                 .uni = { .variants = variants, .c_name = c_name, .name = NULL },
+                .is_const = false
+            };
+            return yap_ctx_insert_type_if_not_exists(ctx, t);
+        }
+        case yap_type_node_array: {
+            yap_type_id elem = yap_build_type_from_type_node(src, tnode->array_type.element_type);
+            if (!elem) return 0;
+            size_t size = 0;
+            if (tnode->array_type.size_expr &&
+                tnode->array_type.size_expr->kind == yap_expr_literal &&
+                tnode->array_type.size_expr->literal.kind == yap_literal_numerical) {
+                size = (size_t)atol(tnode->array_type.size_expr->literal.numerical);
+            } else {
+                yap_build_push_error(src, tnode->loc, "Array size must be an integer literal");
+                return 0;
+            }
+            yap_type t = {
+                .kind = yap_type_array,
+                .array = { .element_type = elem, .size = size },
+                .is_const = false
+            };
+            return yap_ctx_insert_type_if_not_exists(ctx, t);
+        }
+
+        case yap_type_node_slice: {
+            yap_type_id elem = yap_build_type_from_type_node(src, tnode->slice_subtype);
+            if (!elem) return 0;
+            yap_type t = {
+                .kind = yap_type_slice,
+                .slice = { .element_type = elem },
                 .is_const = false
             };
             return yap_ctx_insert_type_if_not_exists(ctx, t);
