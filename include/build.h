@@ -11,7 +11,8 @@ void yap_build_top_level_declaration(yap_source* src, yap_decl_node* node);
 
 // Declarations
 yap_decl yap_build_decl(yap_source* src, yap_decl_node* node);
-yap_decl yap_build_fn_decl(yap_source* src, yap_func_decl_node* fnode);
+yap_decl yap_build_fn_def(yap_source* src, yap_func_decl_node* fnode);
+yap_decl yap_build_fn_declaration(yap_source* src, yap_func_decl_node* fnode);
 yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tnode);
 
 // Statements

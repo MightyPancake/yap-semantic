@@ -113,7 +113,8 @@ void yap_build_top_level_declaration(yap_source* src, yap_decl_node* node){
     yap_ctx* ctx = src->ctx;
 
     switch (node->kind){
-        case yap_decl_func: {
+        case yap_decl_func_decl:
+        case yap_decl_func_def: {
             yap_func_decl_node* f = &node->func_decl;
             if (!f->name.value) return;
 
@@ -159,9 +160,20 @@ void yap_build_top_level_declaration(yap_source* src, yap_decl_node* node){
             yap_log("Pass 1: registered function '%s'", f->name.value);
             break;
         }
-        case yap_decl_named_type:
-            /* Named types are fully built in pass 2 */
+        case yap_decl_named_type: {
+            const char *name = node->named_type_decl.name.value;
+            if (!name) break;
+            yap_type_id existing = yap_ctx_get_type_id_by_name(ctx, (char*)name);
+            if (!existing) {
+                yap_type placeholder = yap_empty_type(yap_type_struct);
+                placeholder.structure = (yap_struct_type){
+                    .fields = NULL, .c_name = (char*)name, .name = (char*)name
+                };
+                yap_ctx_push_named_type(ctx, (char*)name, (char*)name, placeholder);
+                yap_log("Pass 1: registered type placeholder '%s'", name);
+            }
             break;
+        }
         default:
             break;
     }
@@ -175,8 +187,11 @@ yap_decl yap_build_decl(yap_source* src, yap_decl_node* node){
     yap_decl res = { .kind = yap_decl_error };
 
     switch (node->kind){
-        case yap_decl_func:
-            res = yap_build_fn_decl(src, &node->func_decl);
+        case yap_decl_func_def:
+            res = yap_build_fn_def(src, &node->func_decl);
+            break;
+        case yap_decl_func_decl:
+            res = yap_build_fn_declaration(src, &node->func_decl);
             break;
         case yap_decl_named_type:
             res = yap_build_named_type_decl(src, &node->named_type_decl);
@@ -194,7 +209,7 @@ yap_decl yap_build_decl(yap_source* src, yap_decl_node* node){
     return res;
 }
 
-yap_decl yap_build_fn_decl(yap_source* src, yap_func_decl_node* fnode){
+yap_decl yap_build_fn_def(yap_source* src, yap_func_decl_node* fnode){
     yap_ctx* ctx = src->ctx;
 
     if (!fnode->name.value){
@@ -242,12 +257,59 @@ yap_decl yap_build_fn_decl(yap_source* src, yap_func_decl_node* fnode){
     yap_ctx_pop_scope(ctx);
 
     return (yap_decl){
-        .kind      = yap_decl_func,
+        .kind      = yap_decl_func_def,
         .func_decl = (yap_func_decl){
             .name    = fnode->name.value,
             .args    = args,
             .ret_typ = fn_type.return_type,
             .body    = body
+        }
+    };
+}
+
+yap_decl yap_build_fn_declaration(yap_source* src, yap_func_decl_node* fnode){
+    yap_ctx* ctx = src->ctx;
+
+    if (!fnode->name.value){
+        yap_build_push_error(src, fnode->loc, "Missing function name");
+        return (yap_decl){ .kind = yap_decl_error };
+    }
+
+    yap_log("Building function declaration '%s'", fnode->name.value);
+
+    const yap_var* func_var = yap_scope_get_var_recursive(
+        yap_ctx_current_scope(ctx), fnode->name.value);
+
+    if (!func_var){
+        yap_build_push_error(src, fnode->loc,
+            "Internal error: function '%s' not registered in pass 1",
+            fnode->name.value);
+        return (yap_decl){ .kind = yap_decl_error };
+    }
+
+    yap_type* t = yap_ctx_get_type(ctx, func_var->type);
+    if (!t || t->kind != yap_type_func){
+        yap_build_push_error(src, fnode->loc,
+            "Internal error: function '%s' type mismatch in pass 2",
+            fnode->name.value);
+        return (yap_decl){ .kind = yap_decl_error };
+    }
+
+    yap_fn_type fn_type = t->func;
+
+    darr(yap_func_arg) args = yap_ctx_darr_new(ctx, yap_func_arg,
+        .cap = darr_len(fnode->args), .len = 0);
+    for_darr(ai, arg_node, fnode->args){
+        darr_push(args, yap_build_func_arg(src, &arg_node));
+    }
+
+    return (yap_decl){
+        .kind      = yap_decl_func_decl,
+        .func_decl = (yap_func_decl){
+            .name    = fnode->name.value,
+            .args    = args,
+            .ret_typ = fn_type.return_type,
+            .body    = { .kind = yap_block_none }
         }
     };
 }
@@ -319,6 +381,23 @@ yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tn
                 .named_type_decl = (yap_named_type_decl){
                     .name    = name,
                     .kind    = yap_named_type_decl_union,
+                    .type_id = id
+                }
+            };
+        }
+        case yap_named_type_decl_alias: {
+            yap_type t = yap_empty_type(yap_type_struct);
+            t.structure = (yap_struct_type){
+                .fields = yap_ctx_darr_new(ctx, yap_struct_field, .cap = 0, .len = 0),
+                .c_name = name,
+                .name   = name
+            };
+            yap_type_id id = yap_ctx_push_named_type(ctx, name, name, t);
+            return (yap_decl){
+                .kind = yap_decl_named_type,
+                .named_type_decl = (yap_named_type_decl){
+                    .name    = name,
+                    .kind    = yap_named_type_decl_alias,
                     .type_id = id
                 }
             };
