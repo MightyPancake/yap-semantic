@@ -62,6 +62,17 @@ static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(char*
     snode->was_built = true;
     yap_log("Building source: %s (%d declarations)", src->identity, darr_len(snode->declarations));
 
+    // If this source is from a module import, push the module's scope
+    bool pushed_module_scope = false;
+    if (src->from_module_import){
+        yap_module* mod = yap_ctx_get_module(ctx, src->from_module_import);
+        if (mod && mod->scope){
+            darr_push(ctx->current_scopes, mod->scope);
+            pushed_module_scope = true;
+            yap_log("Pushed scope for module '%s'", src->from_module_import);
+        }
+    }
+
     /* Pass 1 – register top-level signatures for mutual recursion */
     for_darr(j, dnode, snode->declarations){
         yap_build_top_level_declaration(src, &dnode);
@@ -74,6 +85,11 @@ static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(char*
         darr_push(ctx->semantic_decls, decl);
         if (ctx->gen_decl)
             ctx->gen_decl(ctx, decl);
+    }
+
+    if (pushed_module_scope){
+        darr_pop(ctx->current_scopes);
+        yap_log("Popped scope for module '%s'", src->from_module_import);
     }
 }
 
@@ -96,10 +112,19 @@ yap_ctx* yap_build(yap_ctx* ctx, yap_args args){
      * deduplicating by origin so each source file is built once. */
     darr(char*) visited_origins = darr_new(char*);
     for_darr(i, imp, ctx->root_source->imports){
-        if (imp.kind != yap_import_file) continue;
-        yap_source* src = find_source_by_identity(ctx, imp.identity);
+        yap_source* src = NULL;
+        if (imp.kind == yap_import_file){
+            src = find_source_by_identity(ctx, imp.identity);
+        } else if (imp.kind == yap_import_module){
+            for_darr(si, s, ctx->sources){
+                if (s && s->from_module_import && strcmp(s->from_module_import, imp.module_name) == 0){
+                    src = s;
+                    break;
+                }
+            }
+        }
         if (!src){
-            yap_log("Failed to find source for import '%s'", imp.identity);
+            yap_log("Failed to find source for import (kind=%d)", imp.kind);
             continue;
         }
         yap_build_source_postorder(ctx, src, visited_origins);
@@ -155,9 +180,19 @@ void yap_build_top_level_declaration(yap_source* src, yap_decl_node* node){
             };
             yap_type_id func_type_id = yap_ctx_insert_type_if_not_exists(ctx, func_type);
 
-            yap_var func_var = { .name = f->name.value, .type = func_type_id };
+            char* c_name;
+            bool should_prefix = node->kind == yap_decl_func_def
+                && ctx->current_module && ctx->current_module->prefix[0]
+                && strcmp(f->name.value, "main") != 0;
+            if (should_prefix) {
+                c_name = yap_ctx_strus_newf(ctx, "%s%s", ctx->current_module->prefix, f->name.value);
+            } else {
+                c_name = f->name.value;
+            }
+
+            yap_var func_var = { .name = f->name.value, .c_name = c_name, .type = func_type_id };
             yap_ctx_push_var(ctx, func_var);
-            yap_log("Pass 1: registered function '%s'", f->name.value);
+            yap_log("Pass 1: registered function '%s' (c_name='%s')", f->name.value, c_name);
             break;
         }
         case yap_decl_named_type: {
@@ -260,6 +295,7 @@ yap_decl yap_build_fn_def(yap_source* src, yap_func_decl_node* fnode){
         .kind      = yap_decl_func_def,
         .func_decl = (yap_func_decl){
             .name    = fnode->name.value,
+            .c_name  = func_var->c_name,
             .args    = args,
             .ret_typ = fn_type.return_type,
             .body    = body
@@ -307,6 +343,7 @@ yap_decl yap_build_fn_declaration(yap_source* src, yap_func_decl_node* fnode){
         .kind      = yap_decl_func_decl,
         .func_decl = (yap_func_decl){
             .name    = fnode->name.value,
+            .c_name  = func_var->c_name,
             .args    = args,
             .ret_typ = fn_type.return_type,
             .body    = { .kind = yap_block_none }
@@ -336,6 +373,7 @@ yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tn
                 .kind = yap_decl_named_type,
                 .named_type_decl = (yap_named_type_decl){
                     .name    = name,
+                    .c_name  = name,
                     .kind    = yap_named_type_decl_struct,
                     .type_id = id
                 }
@@ -358,6 +396,7 @@ yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tn
                 .kind = yap_decl_named_type,
                 .named_type_decl = (yap_named_type_decl){
                     .name    = name,
+                    .c_name  = name,
                     .kind    = yap_named_type_decl_enum,
                     .type_id = id
                 }
@@ -380,6 +419,7 @@ yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tn
                 .kind = yap_decl_named_type,
                 .named_type_decl = (yap_named_type_decl){
                     .name    = name,
+                    .c_name  = name,
                     .kind    = yap_named_type_decl_union,
                     .type_id = id
                 }
@@ -397,6 +437,7 @@ yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tn
                 .kind = yap_decl_named_type,
                 .named_type_decl = (yap_named_type_decl){
                     .name    = name,
+                    .c_name  = name,
                     .kind    = yap_named_type_decl_alias,
                     .type_id = id
                 }
@@ -677,6 +718,7 @@ yap_expr yap_build_expr(yap_source* src, yap_expr_node* node){
         case yap_expr_ternary:       ret = yap_build_ternary_expr(src, &node->ternary);         break;
         case yap_expr_member_access: ret = yap_build_member_access_expr(src, &node->member_access); break;
         case yap_expr_index_access:  ret = yap_build_index_access_expr(src, &node->index_access);  break;
+        case yap_expr_module_access: ret = yap_build_module_access_expr(src, &node->module_access); break;
         default:
             yap_build_push_error(src, node->loc, "Unhandled expression kind");
             break;
@@ -742,7 +784,7 @@ yap_expr yap_build_var_access_expr(yap_source* src, yap_identifier_node* ident){
 
     return (yap_expr){
         .kind        = yap_expr_var,
-        .var_name    = var->name,
+        .var_name    = var->c_name ? var->c_name : var->name,
         .type        = var->type,
         .is_lvalue   = true,
         .is_comptime = false
@@ -1074,6 +1116,41 @@ yap_expr yap_build_index_access_expr(yap_source* src, yap_index_access_node* ia)
             .index  = yap_ctx_one_cpy(ctx, index)
         },
         .type        = element_type,
+        .is_lvalue   = true,
+        .is_comptime = false
+    };
+}
+
+yap_expr yap_build_module_access_expr(yap_source* src, yap_module_access_node* ma){
+    yap_ctx* ctx = src->ctx;
+
+    if (!ma->module.value || !ma->field.value){
+        yap_build_push_error(src, ma->loc, "Invalid module access expression");
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    yap_module* mod = yap_ctx_get_module(ctx, ma->module.value);
+    if (!mod){
+        yap_build_push_error(src, ma->loc, "Unknown module '%s'", ma->module.value);
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    if (!mod->scope){
+        yap_build_push_error(src, ma->loc, "Module '%s' has no scope", ma->module.value);
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    const yap_var* var = yap_scope_get_var(mod->scope, ma->field.value);
+    if (!var){
+        yap_build_push_error(src, ma->loc, "'%s' is not a member of module '%s'",
+            ma->field.value, ma->module.value);
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    return (yap_expr){
+        .kind        = yap_expr_var,
+        .var_name    = var->c_name ? var->c_name : var->name,
+        .type        = var->type,
         .is_lvalue   = true,
         .is_comptime = false
     };
