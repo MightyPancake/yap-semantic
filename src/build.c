@@ -754,6 +754,11 @@ yap_expr yap_build_literal_expr(yap_source* src, yap_literal_node* lit){
             res.type = ctx->bool_type_id;
             res.literal = (yap_literal){ .kind = yap_literal_bool, .text = lit->numerical };
             break;
+        case yap_literal_byte: {
+            res.type = ctx->untyped_byte_type_id;
+            res.literal = (yap_literal){ .kind = yap_literal_byte, .text = lit->numerical };
+            break;
+        }
         case yap_literal_null:
             res.type = ctx->void_type_id;  // null is a void pointer-like value
             res.literal = (yap_literal){ .kind = yap_literal_null, .text = "0" };
