@@ -79,8 +79,17 @@ static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(char*
     }
 
     /* Pass 2 – build full declarations */
+    char* decl_prefix = NULL;
+    if (src->from_module_import) {
+        yap_module* src_mod = yap_ctx_get_module(ctx, src->from_module_import);
+        if (src_mod && src_mod->prefix && src_mod->prefix[0])
+            decl_prefix = src_mod->prefix;
+    } else if (ctx->current_module && ctx->current_module->prefix[0]) {
+        decl_prefix = ctx->current_module->prefix;
+    }
     for_darr(j, dnode, snode->declarations){
         yap_decl decl = yap_build_decl(src, &dnode);
+        decl.module_prefix = decl_prefix;
         yap_log("Pass 2: built declaration kind=%d", decl.kind);
         darr_push(ctx->semantic_decls, decl);
         if (ctx->gen_decl)
@@ -180,19 +189,9 @@ void yap_build_top_level_declaration(yap_source* src, yap_decl_node* node){
             };
             yap_type_id func_type_id = yap_ctx_insert_type_if_not_exists(ctx, func_type);
 
-            char* c_name;
-            bool should_prefix = node->kind == yap_decl_func_def
-                && ctx->current_module && ctx->current_module->prefix[0]
-                && strcmp(f->name.value, "main") != 0;
-            if (should_prefix) {
-                c_name = yap_ctx_strus_newf(ctx, "%s%s", ctx->current_module->prefix, f->name.value);
-            } else {
-                c_name = f->name.value;
-            }
-
-            yap_var func_var = { .name = f->name.value, .c_name = c_name, .type = func_type_id };
+            yap_var func_var = { .name = f->name.value, .type = func_type_id };
             yap_ctx_push_var(ctx, func_var);
-            yap_log("Pass 1: registered function '%s' (c_name='%s')", f->name.value, c_name);
+            yap_log("Pass 1: registered function '%s'", f->name.value);
             break;
         }
         case yap_decl_named_type: {
@@ -295,7 +294,6 @@ yap_decl yap_build_fn_def(yap_source* src, yap_func_decl_node* fnode){
         .kind      = yap_decl_func_def,
         .func_decl = (yap_func_decl){
             .name    = fnode->name.value,
-            .c_name  = func_var->c_name,
             .args    = args,
             .ret_typ = fn_type.return_type,
             .body    = body
@@ -343,7 +341,6 @@ yap_decl yap_build_fn_declaration(yap_source* src, yap_func_decl_node* fnode){
         .kind      = yap_decl_func_decl,
         .func_decl = (yap_func_decl){
             .name    = fnode->name.value,
-            .c_name  = func_var->c_name,
             .args    = args,
             .ret_typ = fn_type.return_type,
             .body    = { .kind = yap_block_none }
@@ -782,9 +779,17 @@ yap_expr yap_build_var_access_expr(yap_source* src, yap_identifier_node* ident){
         return (yap_expr){ .kind = yap_expr_error };
     }
 
+    char* emit_name = var->name;
+    if (ctx->current_module && ctx->current_module->prefix[0]
+        && ctx->current_module->scope
+        && yap_scope_get_var(ctx->current_module->scope, ident->value)
+        && strcmp(ident->value, "main") != 0) {
+        emit_name = yap_ctx_strus_newf(ctx, "%s%s", ctx->current_module->prefix, var->name);
+    }
+
     return (yap_expr){
         .kind        = yap_expr_var,
-        .var_name    = var->c_name ? var->c_name : var->name,
+        .var_name    = emit_name,
         .type        = var->type,
         .is_lvalue   = true,
         .is_comptime = false
@@ -1147,9 +1152,14 @@ yap_expr yap_build_module_access_expr(yap_source* src, yap_module_access_node* m
         return (yap_expr){ .kind = yap_expr_error };
     }
 
+    char* emit_name = var->name;
+    if (mod->prefix && mod->prefix[0]) {
+        emit_name = yap_ctx_strus_newf(ctx, "%s%s", mod->prefix, var->name);
+    }
+
     return (yap_expr){
         .kind        = yap_expr_var,
-        .var_name    = var->c_name ? var->c_name : var->name,
+        .var_name    = emit_name,
         .type        = var->type,
         .is_lvalue   = true,
         .is_comptime = false
