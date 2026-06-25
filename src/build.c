@@ -809,21 +809,31 @@ yap_expr yap_build_bin_expr(yap_source* src, yap_bin_op_node* bin){
     if (left.kind == yap_expr_error || right.kind == yap_expr_error)
         return (yap_expr){ .kind = yap_expr_error };
 
-    if (!strchr("+-*/%", bin->op)){
+    bool is_comparison = strchr("<>enlg", bin->op) != NULL;
+    if (!strchr("+-*/%<>enlg", bin->op)){
         yap_build_push_error(src, bin->loc, "Unsupported binary operator '%c'", bin->op);
         return (yap_expr){ .kind = yap_expr_error };
     }
 
-    if (!yap_ctx_type_ids_eq(ctx, left.type, right.type)){
+    yap_type_id common = yap_ctx_find_common_type(ctx, left.type, right.type);
+    if (common == ctx->internal_error_type_id){
         yap_build_push_error(src, bin->loc, "Incompatible types in binary expression");
         return (yap_expr){ .kind = yap_expr_error };
     }
 
-    yap_type_id result_type = yap_ctx_coerce_type_id_to_id(ctx, left.type);
+    int sem_op = bin->op;
+    if (bin->op == 'e') sem_op = yap_bin_expr_eq;
+    else if (bin->op == 'n') sem_op = yap_bin_expr_neq;
+    else if (bin->op == 'l') sem_op = yap_bin_expr_le;
+    else if (bin->op == 'g') sem_op = yap_bin_expr_ge;
+    else if (bin->op == '<') sem_op = yap_bin_expr_lt;
+    else if (bin->op == '>') sem_op = yap_bin_expr_gt;
+
+    yap_type_id result_type = is_comparison ? ctx->bool_type_id : common;
     return (yap_expr){
         .kind     = yap_expr_bin,
         .bin_expr = (yap_bin_expr){
-            .op    = bin->op,
+            .op    = sem_op,
             .left  = yap_ctx_one_cpy(ctx, left),
             .right = yap_ctx_one_cpy(ctx, right)
         },
