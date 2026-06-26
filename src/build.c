@@ -935,8 +935,11 @@ yap_expr yap_build_func_call_expr(yap_source* src, yap_func_call_node* call){
     }
 
     darr(yap_type_id) expected_args = func_type->func.args;
+    unsigned int params_cap = darr_len(call->args);
+    if (darr_len(expected_args) > params_cap)
+        params_cap = darr_len(expected_args);
     darr(yap_expr)    params = yap_ctx_darr_new(ctx, yap_expr,
-        .cap = darr_len(call->args), .len = 0);
+        .cap = params_cap, .len = 0);
 
     for_darr(pi, arg_node, call->args){
         yap_expr pe = yap_build_expr(src, &arg_node);
@@ -962,6 +965,54 @@ yap_expr yap_build_func_call_expr(yap_source* src, yap_func_call_node* call){
             }
         }
         darr_push(params, pe);
+    }
+
+    if (darr_len(params) < darr_len(expected_args)){
+        yap_func_decl* found_decl = NULL;
+        if (func_expr.kind == yap_expr_var && func_expr.var_name) {
+            for (darr_size_t di = 0; di < darr_len(ctx->semantic_decls); di++){
+                yap_decl* d = &ctx->semantic_decls[di];
+                if ((d->kind == yap_decl_func_def || d->kind == yap_decl_func_decl)
+                    && d->func_decl.name) {
+                    bool match;
+                    if (d->module_prefix && d->module_prefix[0]) {
+                        size_t plen = strlen(d->module_prefix);
+                        size_t nlen = strlen(d->func_decl.name);
+                        size_t vlen = strlen(func_expr.var_name);
+                        match = (vlen == plen + nlen)
+                             && memcmp(func_expr.var_name, d->module_prefix, plen) == 0
+                             && memcmp(func_expr.var_name + plen, d->func_decl.name, nlen) == 0;
+                    } else {
+                        match = strcmp(d->func_decl.name, func_expr.var_name) == 0;
+                    }
+                    if (match) {
+                        found_decl = &d->func_decl;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (found_decl && found_decl->args) {
+            unsigned int provided = darr_len(params);
+            unsigned int expected = darr_len(expected_args);
+            for (unsigned int i = provided; i < expected; i++){
+                if (i < darr_len(found_decl->args)
+                    && found_decl->args[i].kind == yap_func_arg_valid
+                    && found_decl->args[i].default_value.kind != yap_expr_error) {
+                    darr_push(params, found_decl->args[i].default_value);
+                } else {
+                    yap_build_push_error(src, call->loc,
+                        "Missing argument %u with no default value", i + 1);
+                    return (yap_expr){ .kind = yap_expr_error };
+                }
+            }
+        } else {
+            yap_build_push_error(src, call->loc,
+                "Too few arguments: expected %u, got %u",
+                (unsigned)darr_len(expected_args), (unsigned)darr_len(params));
+            return (yap_expr){ .kind = yap_expr_error };
+        }
     }
 
     if (darr_len(params) > darr_len(expected_args)){
@@ -1051,8 +1102,23 @@ static yap_expr yap_build_blob_cast(yap_source* src, yap_expr blob_expr, yap_typ
             darr_push(ordered_names, name);
         }
 
+        for (unsigned int fi = 0; fi < nfields; fi++){
+            if (!used[fi]){
+                if (fields[fi].default_value){
+                    darr_push(ordered, *fields[fi].default_value);
+                    darr_push(ordered_names, fields[fi].name);
+                } else {
+                    yap_build_push_error(src, loc,
+                        "Missing value for field '%s' with no default",
+                        fields[fi].name ? fields[fi].name : "(unnamed)");
+                    return (yap_expr){ .kind = yap_expr_error };
+                }
+            }
+        }
+
         blob_expr.literal.blob.elements = ordered;
         blob_expr.literal.blob.names = ordered_names;
+        blob_expr.literal.blob.field_count = darr_len(ordered);
         blob_expr.type = target_type;
         return blob_expr;
     }
@@ -1573,7 +1639,8 @@ yap_block yap_build_block(yap_source* src, yap_block_node* bnode){
     for_darr(i, stmt_node, bnode->statements){
         yap_statement st = yap_build_statement(src, &stmt_node);
         if (st.kind == yap_statement_error){
-            yap_build_push_error(src, stmt_node.loc, "Invalid statement in block");
+            //Commented out because all statement errors are already reported in yap_build_statement
+            //yap_build_push_error(src, stmt_node.loc, "Invalid statement in block");
             yap_ctx_pop_scope(ctx);
             return (yap_block){ .kind = yap_block_error };
         }
