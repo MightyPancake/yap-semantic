@@ -1,6 +1,8 @@
 #include "yap_semantic.h"
 #include "build.h"
 
+static yap_expr yap_build_blob_cast(yap_source* src, yap_expr blob_expr, yap_type_id target_type, yap_loc loc);
+
 /*
  * Empty-type helper (not yet declared in ctx.h, defined in ctx.c).
  */
@@ -510,8 +512,12 @@ yap_statement yap_build_var_decl_statement(yap_source* src, yap_var_decl_node* v
             init = yap_build_expr(src, &vnode->init);
             if (init.kind == yap_expr_error)
                 return (yap_statement){ .kind = yap_statement_error };
-            // Check that the initializer is assignable to the declared type
-            if (!yap_ctx_type_id_assignable(ctx, declared_type, init.type)){
+            yap_type* init_t = yap_ctx_get_type(ctx, init.type);
+            if (init_t && init_t->kind == yap_type_blob){
+                init = yap_build_blob_cast(src, init, declared_type, vnode->loc);
+                if (init.kind == yap_expr_error)
+                    return (yap_statement){ .kind = yap_statement_error };
+            } else if (!yap_ctx_type_id_assignable(ctx, declared_type, init.type)){
                 char* rhs_str = yap_ctx_type_id_to_string(ctx, init.type);
                 char* lhs_str = yap_ctx_type_id_to_string(ctx, declared_type);
                 yap_build_push_error(src, vnode->loc,
@@ -526,7 +532,13 @@ yap_statement yap_build_var_decl_statement(yap_source* src, yap_var_decl_node* v
         init = yap_build_expr(src, &vnode->init);
         if (init.kind == yap_expr_error)
             return (yap_statement){ .kind = yap_statement_error };
-        yap_type init_type = *yap_ctx_get_type(ctx, init.type);
+        yap_type* init_t = yap_ctx_get_type(ctx, init.type);
+        if (init_t && init_t->kind == yap_type_blob){
+            yap_build_push_error(src, vnode->loc,
+                "Cannot infer type of blob literal");
+            return (yap_statement){ .kind = yap_statement_error };
+        }
+        yap_type init_type = *init_t;
         yap_type var_type  = yap_ctx_coerce_type(ctx, init_type);
         var = (yap_var){
             .name = vnode->name.value,
@@ -763,6 +775,25 @@ yap_expr yap_build_literal_expr(yap_source* src, yap_literal_node* lit){
             res.type = ctx->void_type_id;  // null is a void pointer-like value
             res.literal = (yap_literal){ .kind = yap_literal_null, .text = "0" };
             break;
+        case yap_literal_blob: {
+            unsigned int count = darr_len(lit->blob_elements);
+            darr(yap_expr) elements = yap_ctx_darr_new(ctx, yap_expr, .cap = count, .len = 0);
+            darr(char*) names = yap_ctx_darr_new(ctx, char*, .cap = count, .len = 0);
+            for_darr(i, elem, lit->blob_elements){
+                yap_expr e = yap_build_expr(src, elem.value);
+                if (e.kind == yap_expr_error)
+                    return (yap_expr){ .kind = yap_expr_error };
+                darr_push(elements, e);
+                darr_push(names, elem.is_named ? elem.name.value : NULL);
+            }
+            yap_type_id blob_tid = yap_push_blob_type(ctx, count);
+            res.type = blob_tid;
+            res.literal = (yap_literal){
+                .kind = yap_literal_blob,
+                .blob = (yap_blob){ .elements = elements, .names = names, .field_count = count }
+            };
+            break;
+        }
         default:
             yap_build_push_error(src, lit->loc, "Unhandled literal kind");
             return (yap_expr){ .kind = yap_expr_error };
@@ -914,7 +945,12 @@ yap_expr yap_build_func_call_expr(yap_source* src, yap_func_call_node* call){
 
         if (darr_len(params) < darr_len(expected_args)){
             yap_type_id expected = expected_args[darr_len(params)];
-            if (!yap_ctx_type_id_compatible(ctx, pe.type, expected)){
+            yap_type* pe_type = yap_ctx_get_type(ctx, pe.type);
+            if (pe_type && pe_type->kind == yap_type_blob){
+                pe = yap_build_blob_cast(src, pe, expected, call->loc);
+                if (pe.kind == yap_expr_error)
+                    return (yap_expr){ .kind = yap_expr_error };
+            } else if (!yap_ctx_type_id_compatible(ctx, pe.type, expected)){
                 char* expected_str = yap_ctx_type_id_to_string(ctx, expected);
                 char* actual_str   = yap_ctx_type_id_to_string(ctx, pe.type);
                 yap_build_push_error(src, call->loc,
@@ -947,6 +983,99 @@ yap_expr yap_build_func_call_expr(yap_source* src, yap_func_call_node* call){
     };
 }
 
+static yap_expr yap_build_blob_cast(yap_source* src, yap_expr blob_expr, yap_type_id target_type, yap_loc loc){
+    yap_ctx* ctx = src->ctx;
+    yap_blob blob = blob_expr.literal.blob;
+    yap_type* target = yap_ctx_get_type(ctx, target_type);
+    if (!target){
+        yap_build_push_error(src, loc, "Invalid blob cast target type");
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    if (target->kind == yap_type_struct){
+        if (target->structure.name){
+            yap_type_id resolved_id = yap_ctx_get_type_id_by_name(ctx, target->structure.name);
+            if (resolved_id) {
+                yap_type* resolved = yap_ctx_get_type(ctx, resolved_id);
+                if (resolved && resolved->kind == yap_type_struct && resolved->structure.fields)
+                    target = resolved;
+            }
+        }
+        darr(yap_struct_field) fields = target->structure.fields;
+        if (!fields){
+            yap_build_push_error(src, loc, "Struct type has no fields (forward declaration only)");
+            return (yap_expr){ .kind = yap_expr_error };
+        }
+        unsigned int nfields = darr_len(fields);
+        if (blob.field_count > nfields){
+            yap_build_push_error(src, loc, "Blob has %u elements, struct has %u fields",
+                blob.field_count, nfields);
+            return (yap_expr){ .kind = yap_expr_error };
+        }
+        darr(yap_expr) ordered = yap_ctx_darr_new(ctx, yap_expr, .cap = nfields, .len = 0);
+        darr(char*) ordered_names = yap_ctx_darr_new(ctx, char*, .cap = nfields, .len = 0);
+        bool* used = yap_ctx_malloc(ctx, sizeof(bool) * nfields);
+        for (unsigned int i = 0; i < nfields; i++) used[i] = false;
+
+        unsigned int pos_idx = 0;
+        for (unsigned int i = 0; i < blob.field_count; i++){
+            char* name = blob.names[i];
+            yap_expr elem = blob.elements[i];
+            if (name){
+                bool found = false;
+                for (unsigned int fi = 0; fi < nfields; fi++){
+                    if (fields[fi].name && strus_eq(fields[fi].name, name)){
+                        if (used[fi]){
+                            yap_build_push_error(src, loc, "Duplicate field '%s' in blob", name);
+                            return (yap_expr){ .kind = yap_expr_error };
+                        }
+                        used[fi] = true;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found){
+                    yap_build_push_error(src, loc, "Struct has no field named '%s'", name);
+                    return (yap_expr){ .kind = yap_expr_error };
+                }
+            } else {
+                while (pos_idx < nfields && used[pos_idx]) pos_idx++;
+                if (pos_idx >= nfields){
+                    yap_build_push_error(src, loc, "Too many positional elements in blob");
+                    return (yap_expr){ .kind = yap_expr_error };
+                }
+                used[pos_idx] = true;
+                pos_idx++;
+            }
+            darr_push(ordered, elem);
+            darr_push(ordered_names, name);
+        }
+
+        blob_expr.literal.blob.elements = ordered;
+        blob_expr.literal.blob.names = ordered_names;
+        blob_expr.type = target_type;
+        return blob_expr;
+    }
+
+    if (target->kind == yap_type_array){
+        if (blob.field_count != target->array.size){
+            yap_build_push_error(src, loc, "Blob has %u elements, array has %zu slots",
+                blob.field_count, target->array.size);
+            return (yap_expr){ .kind = yap_expr_error };
+        }
+        blob_expr.type = target_type;
+        return blob_expr;
+    }
+
+    if (target->kind == yap_type_slice){
+        blob_expr.type = target_type;
+        return blob_expr;
+    }
+
+    yap_build_push_error(src, loc, "Blob can only be cast to struct, array, or slice");
+    return (yap_expr){ .kind = yap_expr_error };
+}
+
 yap_expr yap_build_cast_expr(yap_source* src, yap_cast_node* cast){
     yap_ctx* ctx = src->ctx;
 
@@ -959,6 +1088,11 @@ yap_expr yap_build_cast_expr(yap_source* src, yap_cast_node* cast){
     yap_expr expr = yap_build_expr(src, cast->expr);
     if (expr.kind == yap_expr_error)
         return (yap_expr){ .kind = yap_expr_error };
+
+    yap_type* expr_type = yap_ctx_get_type(ctx, expr.type);
+    if (expr_type && expr_type->kind == yap_type_blob){
+        return yap_build_blob_cast(src, expr, target_type, cast->loc);
+    }
 
     return (yap_expr){
         .kind        = yap_expr_cast,
