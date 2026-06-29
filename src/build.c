@@ -3,6 +3,9 @@
 
 static yap_expr yap_build_blob_cast(yap_source* src, yap_expr blob_expr, yap_type_id target_type, yap_loc loc);
 static yap_expr yap_build_macro_expr(yap_source* src, yap_macro_call_node* call);
+static bool yap_is_comptime_type(yap_ctx* ctx, yap_type_id id);
+static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap_type_id* out_ret_type);
+yap_type_id yap_build_type_from_type_node(yap_source* src, yap_type_node* tnode);
 
 /*
  * Empty-type helper (not yet declared in ctx.h, defined in ctx.c).
@@ -81,7 +84,7 @@ static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(char*
         yap_build_top_level_declaration(src, &dnode);
     }
 
-    /* Pass 2 – build full declarations */
+    /* Pass 2 – build full declarations (skip comptime functions already built in Pass 1) */
     char* decl_prefix = NULL;
     if (src->from_module_import) {
         yap_module* src_mod = yap_ctx_get_module(ctx, src->from_module_import);
@@ -497,6 +500,45 @@ yap_statement yap_build_empty_statement(yap_source* src){
 }
 
 yap_statement yap_build_expr_statement(yap_source* src, yap_expr_node* expr_node){
+    if (expr_node->kind == yap_expr_macro){
+        yap_ctx* ctx = src->ctx;
+        yap_type_id ret_type_id = 0;
+        void* result = yap_exec_macro_call(src, &expr_node->macro_call, &ret_type_id);
+        if (ret_type_id == ctx->void_type_id){
+            yap_log("Macro executed (void return)");
+            return (yap_statement){ .kind = yap_statement_empty };
+        }
+        if (!result){
+            if (darr_len(ctx->errors) == 0)
+                yap_build_push_error(src, expr_node->loc, "Macro returned NULL");
+            return (yap_statement){ .kind = yap_statement_error };
+        }
+        if (ret_type_id == ctx->ystatement_type_id){
+            yap_statement* expanded = (yap_statement*)result;
+            yap_log("Macro expanded to statement (kind=%d)", expanded->kind);
+            yap_statement ret = *expanded;
+            if (ret.kind == yap_statement_var_decl && ret.var_decl.kind == yap_var_decl_valid){
+                yap_ctx_push_var(ctx, ret.var_decl.var);
+                yap_log("Macro introduced variable '%s' into scope", ret.var_decl.var.name);
+            }
+            return ret;
+        }
+        if (ret_type_id == ctx->yexpr_type_id){
+            yap_expr* expanded = (yap_expr*)result;
+            yap_expr ret_expr = *expanded;
+            if (ret_expr.kind == yap_expr_var && ret_expr.var_name && !ret_expr.type){
+                const yap_var* var = yap_scope_get_var_recursive(
+                    yap_ctx_current_scope(ctx), ret_expr.var_name);
+                if (var) ret_expr.type = var->type;
+            }
+            return (yap_statement){ .kind = yap_statement_expr, .expr = ret_expr };
+        }
+        if (ret_type_id == ctx->ytype_type_id){
+            return (yap_statement){ .kind = yap_statement_empty };
+        }
+        yap_build_push_error(src, expr_node->loc, "Unsupported macro return type in statement position");
+        return (yap_statement){ .kind = yap_statement_error };
+    }
     yap_expr e = yap_build_expr(src, expr_node);
     if (e.kind == yap_expr_error)
         return (yap_statement){ .kind = yap_statement_error };
@@ -1404,37 +1446,43 @@ static bool yap_is_comptime_type(yap_ctx* ctx, yap_type_id id){
     return id == ctx->yexpr_type_id
         || id == ctx->ytype_type_id
         || id == ctx->ystatement_type_id
-        || id == ctx->yfunc_type_id;
+        || id == ctx->yfunc_type_id
+        || id == ctx->void_type_id;
 }
 
-static yap_expr yap_build_macro_expr(yap_source* src, yap_macro_call_node* call){
+static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap_type_id* out_ret_type){
     yap_ctx* ctx = src->ctx;
+    *out_ret_type = 0;
 
     if (!call->caller){
         yap_build_push_error(src, call->loc, "Missing macro caller");
-        return (yap_expr){ .kind = yap_expr_error };
+        return NULL;
     }
 
     yap_expr caller = yap_build_expr(src, call->caller);
-    if (caller.kind == yap_expr_error)
-        return (yap_expr){ .kind = yap_expr_error };
+    if (caller.kind == yap_expr_error) return NULL;
 
     yap_type* func_type = yap_ctx_get_type(ctx, caller.type);
     if (!func_type || func_type->kind != yap_type_func){
         yap_build_push_error(src, call->loc, "Macro caller is not a function");
-        return (yap_expr){ .kind = yap_expr_error };
+        return NULL;
     }
 
-    yap_type_id ret_type_id = func_type->func.return_type;
-    if (!yap_is_comptime_type(ctx, ret_type_id)){
+    *out_ret_type = func_type->func.return_type;
+    if (*out_ret_type == ctx->yident_type_id){
+        yap_build_push_error(src, call->loc,
+            "Macro function cannot return yIdent — identifiers can only come from +ident or yapi->uniq_name()");
+        return NULL;
+    }
+    if (!yap_is_comptime_type(ctx, *out_ret_type)){
         yap_build_push_error(src, call->loc,
             "Macro function must return a comptime type (yExpr, yType, yStatement, yFunc)");
-        return (yap_expr){ .kind = yap_expr_error };
+        return NULL;
     }
 
     darr(yap_type_id) expected_args = func_type->func.args;
     unsigned int expected_count = darr_len(expected_args);
-    unsigned int provided_count = call->is_paramless ? 0 : darr_len(call->params);
+    unsigned int provided_count = darr_len(call->params);
 
     void** arg_ptrs = NULL;
     if (provided_count > 0)
@@ -1442,38 +1490,86 @@ static yap_expr yap_build_macro_expr(yap_source* src, yap_macro_call_node* call)
 
     for (unsigned int i = 0; i < provided_count; i++){
         yap_macro_param_node* param = &call->params[i];
+        yap_type_id expected_arg_type = (i < expected_count) ? expected_args[i] : 0;
+        bool arg_is_type = (expected_arg_type == ctx->ytype_type_id);
+
+        if (arg_is_type && param->kind == yap_macro_param_unnamed){
+            yap_type_id tid = 0;
+            if (param->expr->kind == yap_expr_var && param->expr->var.value){
+                tid = yap_ctx_get_type_id_by_name(ctx, param->expr->var.value);
+            }
+            if (!tid){
+                yap_build_push_error(src, param->loc, "Cannot resolve type argument");
+                free(arg_ptrs); return NULL;
+            }
+            arg_ptrs[i] = (void*)(uintptr_t)tid;
+            continue;
+        }
+
         switch (param->kind){
             case yap_macro_param_unnamed: {
                 yap_expr built = yap_build_expr(src, param->expr);
-                if (built.kind == yap_expr_error){
-                    free(arg_ptrs);
-                    return (yap_expr){ .kind = yap_expr_error };
+                if (built.kind == yap_expr_error){ free(arg_ptrs); return NULL; }
+                if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_numerical){
+                    if (strchr(built.literal.text, '.'))
+                        { double v = atof(built.literal.text); double* p = yap_ctx_one(ctx, double); *p = v; arg_ptrs[i] = p; }
+                    else
+                        { long v = atol(built.literal.text); arg_ptrs[i] = (void*)(uintptr_t)v; }
+                } else if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_string){
+                    arg_ptrs[i] = (void*)built.literal.text;
+                } else if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_cstring){
+                    arg_ptrs[i] = (void*)built.literal.text;
+                } else if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_bool){
+                    arg_ptrs[i] = (void*)(uintptr_t)(strus_eq(built.literal.text, "true") ? 1 : 0);
+                } else {
+                    yap_build_push_error(src, param->loc,
+                        "Comptime call argument must be a literal (use #expr to pass as AST node)");
+                    free(arg_ptrs); return NULL;
                 }
-                yap_expr* heap_copy = malloc(sizeof(yap_expr));
-                *heap_copy = built;
-                arg_ptrs[i] = heap_copy;
+                break;
+            }
+            case yap_macro_param_ast: {
+                yap_expr built = yap_build_expr(src, param->expr);
+                if (built.kind == yap_expr_error){ free(arg_ptrs); return NULL; }
+                arg_ptrs[i] = yap_ctx_one_cpy(ctx, built);
                 break;
             }
             case yap_macro_param_named: {
                 if (!param->named.value){
                     yap_build_push_error(src, param->loc, "Missing value in named macro parameter");
-                    free(arg_ptrs);
-                    return (yap_expr){ .kind = yap_expr_error };
+                    free(arg_ptrs); return NULL;
                 }
                 yap_expr built = yap_build_expr(src, param->named.value);
-                if (built.kind == yap_expr_error){
-                    free(arg_ptrs);
-                    return (yap_expr){ .kind = yap_expr_error };
+                if (built.kind == yap_expr_error){ free(arg_ptrs); return NULL; }
+                arg_ptrs[i] = yap_ctx_one_cpy(ctx, built);
+                break;
+            }
+            case yap_macro_param_ident_add: {
+                char* name = param->ident_add.value;
+                if (!name){ free(arg_ptrs); return NULL; }
+                const yap_var* existing = yap_scope_get_var_recursive(
+                    yap_ctx_current_scope(ctx), name);
+                if (existing){
+                    yap_build_push_error(src, param->loc,
+                        "Identifier '%s' is already in scope (used with +ident)", name);
+                    free(arg_ptrs); return NULL;
                 }
-                yap_expr* heap_copy = malloc(sizeof(yap_expr));
-                *heap_copy = built;
-                arg_ptrs[i] = heap_copy;
+                arg_ptrs[i] = yap_ctx_strus_cpy(ctx, name);
+                break;
+            }
+            case yap_macro_param_mut: {
+                yap_expr built = yap_build_expr(src, param->mut_expr);
+                if (built.kind == yap_expr_error){ free(arg_ptrs); return NULL; }
+                if (!built.is_lvalue){
+                    yap_build_push_error(src, param->loc, "Mutable macro parameter must be an lvalue");
+                    free(arg_ptrs); return NULL;
+                }
+                arg_ptrs[i] = yap_ctx_one_cpy(ctx, built);
                 break;
             }
             default:
                 yap_build_push_error(src, param->loc, "Unsupported macro parameter kind");
-                free(arg_ptrs);
-                return (yap_expr){ .kind = yap_expr_error };
+                free(arg_ptrs); return NULL;
         }
     }
 
@@ -1481,16 +1577,12 @@ static yap_expr yap_build_macro_expr(yap_source* src, yap_macro_call_node* call)
         yap_build_push_error(src, call->loc,
             "Macro argument count mismatch: expected %u, got %u",
             expected_count, provided_count);
-        for (unsigned int i = 0; i < provided_count; i++) free(arg_ptrs[i]);
-        free(arg_ptrs);
-        return (yap_expr){ .kind = yap_expr_error };
+        free(arg_ptrs); return NULL;
     }
 
     if (!ctx->ensure_symbol){
         yap_build_push_error(src, call->loc, "No backend symbol resolver available for macro execution");
-        for (unsigned int i = 0; i < provided_count; i++) free(arg_ptrs[i]);
-        free(arg_ptrs);
-        return (yap_expr){ .kind = yap_expr_error };
+        free(arg_ptrs); return NULL;
     }
 
     char* func_name = NULL;
@@ -1499,77 +1591,119 @@ static yap_expr yap_build_macro_expr(yap_source* src, yap_macro_call_node* call)
 
     if (!func_name){
         yap_build_push_error(src, call->loc, "Cannot resolve macro function name");
-        for (unsigned int i = 0; i < provided_count; i++) free(arg_ptrs[i]);
-        free(arg_ptrs);
-        return (yap_expr){ .kind = yap_expr_error };
+        free(arg_ptrs); return NULL;
     }
 
     void* sym = ctx->ensure_symbol(ctx, func_name);
     if (!sym){
         yap_build_push_error(src, call->loc,
             "Failed to resolve macro function '%s' in TCC", func_name);
-        for (unsigned int i = 0; i < provided_count; i++) free(arg_ptrs[i]);
-        free(arg_ptrs);
-        return (yap_expr){ .kind = yap_expr_error };
+        free(arg_ptrs); return NULL;
     }
 
     yap_log("Executing macro '%s' with %u args", func_name, provided_count);
+    if (ctx->set_macro_name)
+        ctx->set_macro_name(func_name);
+    if (ctx->set_macro_loc){
+        yap_source* ct_src = yap_ctx_one(ctx, yap_source);
+        *ct_src = (yap_source){
+            .kind = yap_source_comptime,
+            .identity = func_name,
+            .parent = src,
+            .label = func_name,
+            .origin = NULL,
+            .content = src->content,
+            .sz = src->sz,
+            .ctx = ctx,
+            .import_loc = call->loc,
+        };
+        ctx->set_macro_loc(ct_src, call->loc);
+    }
 
     void* result = NULL;
     switch (provided_count){
-        case 0: {
-            typedef void* (*fn0_t)(void);
-            result = ((fn0_t)sym)();
-            break;
-        }
-        case 1: {
-            typedef void* (*fn1_t)(void*);
-            result = ((fn1_t)sym)(arg_ptrs[0]);
-            break;
-        }
-        case 2: {
-            typedef void* (*fn2_t)(void*, void*);
-            result = ((fn2_t)sym)(arg_ptrs[0], arg_ptrs[1]);
-            break;
-        }
-        case 3: {
-            typedef void* (*fn3_t)(void*, void*, void*);
-            result = ((fn3_t)sym)(arg_ptrs[0], arg_ptrs[1], arg_ptrs[2]);
-            break;
-        }
-        case 4: {
-            typedef void* (*fn4_t)(void*, void*, void*, void*);
-            result = ((fn4_t)sym)(arg_ptrs[0], arg_ptrs[1], arg_ptrs[2], arg_ptrs[3]);
-            break;
-        }
+        case 0: { typedef void* (*fn0_t)(void);                             result = ((fn0_t)sym)(); break; }
+        case 1: { typedef void* (*fn1_t)(void*);                            result = ((fn1_t)sym)(arg_ptrs[0]); break; }
+        case 2: { typedef void* (*fn2_t)(void*, void*);                     result = ((fn2_t)sym)(arg_ptrs[0], arg_ptrs[1]); break; }
+        case 3: { typedef void* (*fn3_t)(void*, void*, void*);              result = ((fn3_t)sym)(arg_ptrs[0], arg_ptrs[1], arg_ptrs[2]); break; }
+        case 4: { typedef void* (*fn4_t)(void*, void*, void*, void*);       result = ((fn4_t)sym)(arg_ptrs[0], arg_ptrs[1], arg_ptrs[2], arg_ptrs[3]); break; }
         default:
             yap_build_push_error(src, call->loc,
                 "Too many macro arguments (max 4 supported currently, got %u)", provided_count);
-            for (unsigned int i = 0; i < provided_count; i++) free(arg_ptrs[i]);
-            free(arg_ptrs);
-            return (yap_expr){ .kind = yap_expr_error };
+            free(arg_ptrs); return NULL;
     }
 
+    if (ctx->pop_macro_loc)
+        ctx->pop_macro_loc();
+
+    free(arg_ptrs);
+    return result;
+}
+
+static yap_expr yap_build_macro_expr(yap_source* src, yap_macro_call_node* call){
+    yap_ctx* ctx = src->ctx;
+    yap_type_id ret_type_id = 0;
+    void* result = yap_exec_macro_call(src, call, &ret_type_id);
+
     if (!result){
-        for (unsigned int i = 0; i < provided_count; i++) free(arg_ptrs[i]);
-        free(arg_ptrs);
-        yap_build_push_error(src, call->loc, "Macro '%s' returned NULL", func_name);
+        if (darr_len(ctx->errors) == 0)
+            yap_build_push_error(src, call->loc, "Macro returned NULL");
         return (yap_expr){ .kind = yap_expr_error };
     }
 
-    yap_expr ret_expr = { .kind = yap_expr_error };
     if (ret_type_id == ctx->yexpr_type_id){
         yap_expr* expanded = (yap_expr*)result;
-        yap_log("Macro '%s' expanded to expression (kind=%d)", func_name, expanded->kind);
-        ret_expr = *expanded;
-    } else {
-        yap_build_push_error(src, call->loc,
-            "Macro '%s' returned unsupported comptime type (only yExpr is supported currently)", func_name);
+        yap_log("Macro expanded to expression (kind=%d)", expanded->kind);
+        yap_expr ret = *expanded;
+        if (ret.kind == yap_expr_var && ret.var_name && !ret.type){
+            const yap_var* var = yap_scope_get_var_recursive(
+                yap_ctx_current_scope(ctx), ret.var_name);
+            if (var){
+                ret.type = var->type;
+            } else {
+                yap_build_push_error(src, call->loc,
+                    "Macro produced reference to undefined variable '%s'", ret.var_name);
+                return (yap_expr){ .kind = yap_expr_error };
+            }
+        }
+        return ret;
     }
 
-    for (unsigned int i = 0; i < provided_count; i++) free(arg_ptrs[i]);
-    free(arg_ptrs);
-    return ret_expr;
+    if (ret_type_id == ctx->ytype_type_id){
+        yap_build_push_error(src, call->loc,
+            "Macro returns yType but was used in expression position; use it in type position instead");
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    if (ret_type_id == ctx->ystatement_type_id){
+        yap_build_push_error(src, call->loc,
+            "Macro returns yStatement but was used in expression position; use it as a statement instead");
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    yap_build_push_error(src, call->loc, "Unsupported macro return type in expression position");
+    return (yap_expr){ .kind = yap_expr_error };
+}
+
+static yap_type_id yap_build_macro_type(yap_source* src, yap_macro_call_node* call){
+    yap_ctx* ctx = src->ctx;
+    yap_type_id ret_type_id = 0;
+    void* result = yap_exec_macro_call(src, call, &ret_type_id);
+
+    if (!result){
+        if (darr_len(ctx->errors) == 0)
+            yap_build_push_error(src, call->loc, "Macro returned NULL");
+        return 0;
+    }
+
+    if (ret_type_id == ctx->ytype_type_id){
+        yap_type_id tid = (yap_type_id)(uintptr_t)result;
+        yap_log("Macro expanded to type id=%u", tid);
+        return tid;
+    }
+
+    yap_build_push_error(src, call->loc, "Macro in type position must return yType");
+    return 0;
 }
 
 yap_type_id yap_build_type_from_type_node(yap_source* src, yap_type_node* tnode){
@@ -1710,8 +1844,7 @@ yap_type_id yap_build_type_from_type_node(yap_source* src, yap_type_node* tnode)
         }
 
         case yap_type_node_macro: {
-            yap_build_push_error(src, tnode->loc, "Macro type expansion not yet supported");
-            return 0;
+            return yap_build_macro_type(src, &tnode->macro_call);
         }
     }
     return 0;
