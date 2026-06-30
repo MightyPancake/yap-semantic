@@ -46,6 +46,7 @@ yap_expr yap_build_member_access_expr(yap_source* src, yap_member_access_node* m
 yap_expr yap_build_optional_member_access_expr(yap_source* src, yap_member_access_node* ma);
 yap_expr yap_build_deref_expr(yap_source* src, yap_deref_node* dn);
 yap_expr yap_build_index_access_expr(yap_source* src, yap_index_access_node* ia);
+yap_expr yap_build_block_expr(yap_source* src, yap_block_node* bnode);
 yap_expr yap_build_module_access_expr(yap_source* src, yap_module_access_node* ma);
 
 // Helpers

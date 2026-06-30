@@ -149,6 +149,34 @@ yap_ctx* yap_build(yap_ctx* ctx, yap_args args){
     return ctx;
 }
 
+/* Functions whose first argument is a named struct/union/enum become methods:
+ * only reachable as 'recv:name(args)', registered under a mangled
+ * "TypeName_funcname" symbol so each type can have its own function of that
+ * name. Computed independently (not cached on the AST node) so Pass 1 and
+ * Pass 2 - which each iterate their own by-value copy of the declaration -
+ * agree on the same name. */
+static char* yap_func_decl_emit_name(yap_ctx* ctx, yap_func_decl_node* fnode){
+    if (darr_len(fnode->args) == 0 || strcmp(fnode->name.value, "main") == 0)
+        return fnode->name.value;
+
+    yap_func_arg_node first = fnode->args[0];
+    if (!first.is_valid || !first.has_type || !first.type_node
+        || first.type_node->kind != yap_type_node_identifier || !first.type_node->identifier.value)
+        return fnode->name.value;
+
+    yap_type_id tid = yap_ctx_get_type_id_by_name(ctx, first.type_node->identifier.value);
+    yap_type* t = tid ? yap_ctx_get_type(ctx, tid) : NULL;
+    if (!t) return fnode->name.value;
+
+    const char* owner_name = NULL;
+    if (t->kind == yap_type_struct) owner_name = t->structure.name;
+    else if (t->kind == yap_type_union) owner_name = t->uni.name;
+    else if (t->kind == yap_type_enum) owner_name = t->enumeration.name;
+    if (!owner_name || !owner_name[0]) return fnode->name.value;
+
+    return yap_ctx_strus_newf(ctx, "%s_%s", owner_name, fnode->name.value);
+}
+
 void yap_build_top_level_declaration(yap_source* src, yap_decl_node* node){
     yap_ctx* ctx = src->ctx;
 
@@ -195,9 +223,10 @@ void yap_build_top_level_declaration(yap_source* src, yap_decl_node* node){
             };
             yap_type_id func_type_id = yap_ctx_insert_type_if_not_exists(ctx, func_type);
 
-            yap_var func_var = { .name = f->name.value, .type = func_type_id };
+            char* emit_name = yap_func_decl_emit_name(ctx, f);
+            yap_var func_var = { .name = emit_name, .type = func_type_id };
             yap_ctx_push_var(ctx, func_var);
-            yap_log("Pass 1: registered function '%s'", f->name.value);
+            yap_log("Pass 1: registered function '%s'", emit_name);
             break;
         }
         case yap_decl_named_type: {
@@ -262,10 +291,11 @@ yap_decl yap_build_fn_def(yap_source* src, yap_func_decl_node* fnode){
         return (yap_decl){ .kind = yap_decl_error };
     }
 
-    yap_log("Building function '%s'", fnode->name.value);
+    char* emit_name = yap_func_decl_emit_name(ctx, fnode);
+    yap_log("Building function '%s' (emit name '%s')", fnode->name.value, emit_name);
 
     const yap_var* func_var = yap_scope_get_var_recursive(
-        yap_ctx_current_scope(ctx), fnode->name.value);
+        yap_ctx_current_scope(ctx), emit_name);
 
     if (!func_var){
         yap_build_push_error(src, fnode->loc,
@@ -304,7 +334,7 @@ yap_decl yap_build_fn_def(yap_source* src, yap_func_decl_node* fnode){
     return (yap_decl){
         .kind      = yap_decl_func_def,
         .func_decl = (yap_func_decl){
-            .name    = fnode->name.value,
+            .name    = emit_name,
             .args    = args,
             .ret_typ = fn_type.return_type,
             .body    = body
@@ -320,10 +350,11 @@ yap_decl yap_build_fn_declaration(yap_source* src, yap_func_decl_node* fnode){
         return (yap_decl){ .kind = yap_decl_error };
     }
 
-    yap_log("Building function declaration '%s'", fnode->name.value);
+    char* emit_name = yap_func_decl_emit_name(ctx, fnode);
+    yap_log("Building function declaration '%s' (emit name '%s')", fnode->name.value, emit_name);
 
     const yap_var* func_var = yap_scope_get_var_recursive(
-        yap_ctx_current_scope(ctx), fnode->name.value);
+        yap_ctx_current_scope(ctx), emit_name);
 
     if (!func_var){
         yap_build_push_error(src, fnode->loc,
@@ -351,7 +382,7 @@ yap_decl yap_build_fn_declaration(yap_source* src, yap_func_decl_node* fnode){
     return (yap_decl){
         .kind      = yap_decl_func_decl,
         .func_decl = (yap_func_decl){
-            .name    = fnode->name.value,
+            .name    = emit_name,
             .args    = args,
             .ret_typ = fn_type.return_type,
             .body    = { .kind = yap_block_none }
@@ -785,8 +816,12 @@ yap_expr yap_build_expr(yap_source* src, yap_expr_node* node){
         case yap_expr_optional_member_access: ret = yap_build_optional_member_access_expr(src, &node->member_access); break;
         case yap_expr_deref:         ret = yap_build_deref_expr(src, &node->deref);              break;
         case yap_expr_index_access:  ret = yap_build_index_access_expr(src, &node->index_access);  break;
+        case yap_expr_block:         ret = yap_build_block_expr(src, &node->block);                break;
         case yap_expr_module_access: ret = yap_build_module_access_expr(src, &node->module_access); break;
         case yap_expr_macro:         ret = yap_build_macro_expr(src, &node->macro_call); break;
+        case yap_expr_method_access:
+            yap_build_push_error(src, node->loc, "Method access must be called, e.g. 'obj:%s(args)'", node->method_access.name.value);
+            break;
         default:
             yap_build_push_error(src, node->loc, "Unhandled expression kind");
             break;
@@ -980,10 +1015,59 @@ yap_expr yap_build_assignment_expr(yap_source* src, yap_assignment_node* assign)
     };
 }
 
+/* Resolves 'recv:name' to the mangled "TypeName_name" function var and
+ * builds the receiver expression that becomes the call's first argument. */
+static yap_expr yap_build_method_callee(yap_source* src, yap_method_access_node* ma, yap_expr* out_receiver){
+    yap_ctx* ctx = src->ctx;
+
+    yap_expr receiver = yap_build_expr(src, ma->caller);
+    if (receiver.kind == yap_expr_error)
+        return (yap_expr){ .kind = yap_expr_error };
+
+    yap_type* recv_type = yap_ctx_get_type(ctx, receiver.type);
+    const char* owner_name = NULL;
+    if (recv_type){
+        if (recv_type->kind == yap_type_struct) owner_name = recv_type->structure.name;
+        else if (recv_type->kind == yap_type_union) owner_name = recv_type->uni.name;
+        else if (recv_type->kind == yap_type_enum) owner_name = recv_type->enumeration.name;
+    }
+    if (!owner_name || !owner_name[0]){
+        char* type_str = yap_ctx_type_id_to_string(ctx, receiver.type);
+        yap_build_push_error(src, ma->loc, "Type '%s' has no methods", type_str);
+        free(type_str);
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    if (!ma->name.value){
+        yap_build_push_error(src, ma->loc, "Missing method name");
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    char* mangled_name = yap_ctx_strus_newf(ctx, "%s_%s", owner_name, ma->name.value);
+    const yap_var* method_var = yap_scope_get_var_recursive(yap_ctx_current_scope(ctx), mangled_name);
+    if (!method_var){
+        yap_build_push_error(src, ma->loc, "No method '%s' found for type '%s'", ma->name.value, owner_name);
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    *out_receiver = receiver;
+    return (yap_expr){
+        .kind        = yap_expr_var,
+        .var_name    = method_var->name,
+        .type        = method_var->type,
+        .is_lvalue   = true,
+        .is_comptime = false
+    };
+}
+
 yap_expr yap_build_func_call_expr(yap_source* src, yap_func_call_node* call){
     yap_ctx* ctx = src->ctx;
 
-    yap_expr func_expr = yap_build_expr(src, call->func);
+    bool is_method_call = call->func->kind == yap_expr_method_access;
+    yap_expr receiver = {0};
+    yap_expr func_expr = is_method_call
+        ? yap_build_method_callee(src, &call->func->method_access, &receiver)
+        : yap_build_expr(src, call->func);
     if (func_expr.kind == yap_expr_error)
         return (yap_expr){ .kind = yap_expr_error };
 
@@ -994,11 +1078,25 @@ yap_expr yap_build_func_call_expr(yap_source* src, yap_func_call_node* call){
     }
 
     darr(yap_type_id) expected_args = func_type->func.args;
-    unsigned int params_cap = darr_len(call->args);
+    unsigned int params_cap = darr_len(call->args) + (is_method_call ? 1 : 0);
     if (darr_len(expected_args) > params_cap)
         params_cap = darr_len(expected_args);
     darr(yap_expr)    params = yap_ctx_darr_new(ctx, yap_expr,
         .cap = params_cap, .len = 0);
+
+    if (is_method_call){
+        if (darr_len(expected_args) > 0 && !yap_ctx_type_id_compatible(ctx, receiver.type, expected_args[0])){
+            char* expected_str = yap_ctx_type_id_to_string(ctx, expected_args[0]);
+            char* actual_str   = yap_ctx_type_id_to_string(ctx, receiver.type);
+            yap_build_push_error(src, call->loc,
+                "Receiver type mismatch for method '%s': expected '%s', got '%s'",
+                call->func->method_access.name.value, expected_str, actual_str);
+            free(expected_str);
+            free(actual_str);
+            return (yap_expr){ .kind = yap_expr_error };
+        }
+        darr_push(params, receiver);
+    }
 
     for_darr(pi, arg_node, call->args){
         yap_expr pe = yap_build_expr(src, &arg_node);
@@ -1463,6 +1561,35 @@ yap_expr yap_build_index_access_expr(yap_source* src, yap_index_access_node* ia)
         .type        = element_type,
         .is_lvalue   = true,
         .is_comptime = false
+    };
+}
+
+yap_expr yap_build_block_expr(yap_source* src, yap_block_node* bnode){
+    yap_ctx* ctx = src->ctx;
+
+    yap_block block = yap_build_block(src, bnode);
+    if (block.kind != yap_block_valid){
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    if (darr_len(block.statements) == 0){
+        yap_build_push_error(src, bnode->loc, "Block expression cannot be empty");
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    yap_statement last = block.statements[darr_len(block.statements) - 1];
+    if (last.kind != yap_statement_expr){
+        yap_build_push_error(src, bnode->loc,
+            "Block expression's last statement must be an expression");
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    return (yap_expr){
+        .kind        = yap_expr_block,
+        .block       = yap_ctx_one_cpy(ctx, block),
+        .type        = last.expr.type,
+        .is_lvalue   = last.expr.is_lvalue,
+        .is_comptime = last.expr.is_comptime
     };
 }
 
