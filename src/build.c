@@ -149,29 +149,30 @@ yap_ctx* yap_build(yap_ctx* ctx, yap_args args){
     return ctx;
 }
 
-/* Functions whose first argument is a named struct/union/enum become methods:
- * only reachable as 'recv:name(args)', registered under a mangled
+/* Named struct/union/enum types are the only eligible method subjects. */
+static const char* yap_named_type_owner_name(yap_type* t){
+    if (!t) return NULL;
+    if (t->kind == yap_type_struct) return t->structure.name;
+    if (t->kind == yap_type_union)  return t->uni.name;
+    if (t->kind == yap_type_enum)   return t->enumeration.name;
+    return NULL;
+}
+
+/* Functions declared with an explicit 'subj_type subj_name:' subject become
+ * methods: only reachable as 'recv:name(args)', registered under a mangled
  * "TypeName_funcname" symbol so each type can have its own function of that
  * name. Computed independently (not cached on the AST node) so Pass 1 and
  * Pass 2 - which each iterate their own by-value copy of the declaration -
  * agree on the same name. */
 static char* yap_func_decl_emit_name(yap_ctx* ctx, yap_func_decl_node* fnode){
-    if (darr_len(fnode->args) == 0 || strcmp(fnode->name.value, "main") == 0)
+    if (!fnode->has_subject || !fnode->subject_type_node
+        || fnode->subject_type_node->kind != yap_type_node_identifier
+        || !fnode->subject_type_node->identifier.value)
         return fnode->name.value;
 
-    yap_func_arg_node first = fnode->args[0];
-    if (!first.is_valid || !first.has_type || !first.type_node
-        || first.type_node->kind != yap_type_node_identifier || !first.type_node->identifier.value)
-        return fnode->name.value;
-
-    yap_type_id tid = yap_ctx_get_type_id_by_name(ctx, first.type_node->identifier.value);
+    yap_type_id tid = yap_ctx_get_type_id_by_name(ctx, fnode->subject_type_node->identifier.value);
     yap_type* t = tid ? yap_ctx_get_type(ctx, tid) : NULL;
-    if (!t) return fnode->name.value;
-
-    const char* owner_name = NULL;
-    if (t->kind == yap_type_struct) owner_name = t->structure.name;
-    else if (t->kind == yap_type_union) owner_name = t->uni.name;
-    else if (t->kind == yap_type_enum) owner_name = t->enumeration.name;
+    const char* owner_name = yap_named_type_owner_name(t);
     if (!owner_name || !owner_name[0]) return fnode->name.value;
 
     return yap_ctx_strus_newf(ctx, "%s_%s", owner_name, fnode->name.value);
@@ -197,9 +198,28 @@ void yap_build_top_level_declaration(yap_source* src, yap_decl_node* node){
             }
 
             darr(yap_type_id) arg_type_ids = yap_ctx_darr_new(ctx, yap_type_id,
-                .cap = darr_len(f->args), .len = 0);
+                .cap = darr_len(f->args) + (f->has_subject ? 1 : 0), .len = 0);
             darr(char*) arg_names = yap_ctx_darr_new(ctx, char*,
                 .cap = darr_len(f->args), .len = 0);
+
+            if (f->has_subject){
+                if (!f->subject_name.value){
+                    yap_build_push_error(src, f->loc, "Missing subject name in function '%s'", f->name.value);
+                    return;
+                }
+                yap_type_id subj_tid = yap_build_type_from_type_node(src, f->subject_type_node);
+                if (!subj_tid){
+                    yap_build_push_error(src, f->subject_type_node->loc,
+                        "Invalid subject type in function '%s'", f->name.value);
+                    return;
+                }
+                if (!yap_named_type_owner_name(yap_ctx_get_type(ctx, subj_tid))){
+                    yap_build_push_error(src, f->subject_type_node->loc,
+                        "Subject type must be a named struct, union or enum in function '%s'", f->name.value);
+                    return;
+                }
+                darr_push(arg_type_ids, subj_tid);
+            }
 
             for_darr(ai, arg_node, f->args){
                 if (!arg_node.is_valid) continue;
@@ -283,6 +303,19 @@ yap_decl yap_build_decl(yap_source* src, yap_decl_node* node){
     return res;
 }
 
+/* Builds the receiver declared via 'subj_type subj_name:' as the function's
+ * implicit first argument, mirroring yap_build_func_arg for regular args. */
+static yap_func_arg yap_build_subject_arg(yap_source* src, yap_func_decl_node* fnode){
+    yap_type_id type = yap_build_type_from_type_node(src, fnode->subject_type_node);
+    if (!type) return (yap_func_arg){ .kind = yap_func_arg_error };
+
+    return (yap_func_arg){
+        .kind = yap_func_arg_valid,
+        .name = fnode->subject_name.value,
+        .type = type
+    };
+}
+
 yap_decl yap_build_fn_def(yap_source* src, yap_func_decl_node* fnode){
     yap_ctx* ctx = src->ctx;
 
@@ -315,7 +348,10 @@ yap_decl yap_build_fn_def(yap_source* src, yap_func_decl_node* fnode){
     yap_fn_type fn_type = t->func;
 
     darr(yap_func_arg) args = yap_ctx_darr_new(ctx, yap_func_arg,
-        .cap = darr_len(fnode->args), .len = 0);
+        .cap = darr_len(fnode->args) + (fnode->has_subject ? 1 : 0), .len = 0);
+    if (fnode->has_subject){
+        darr_push(args, yap_build_subject_arg(src, fnode));
+    }
     for_darr(ai, arg_node, fnode->args){
         darr_push(args, yap_build_func_arg(src, &arg_node));
     }
@@ -374,7 +410,10 @@ yap_decl yap_build_fn_declaration(yap_source* src, yap_func_decl_node* fnode){
     yap_fn_type fn_type = t->func;
 
     darr(yap_func_arg) args = yap_ctx_darr_new(ctx, yap_func_arg,
-        .cap = darr_len(fnode->args), .len = 0);
+        .cap = darr_len(fnode->args) + (fnode->has_subject ? 1 : 0), .len = 0);
+    if (fnode->has_subject){
+        darr_push(args, yap_build_subject_arg(src, fnode));
+    }
     for_darr(ai, arg_node, fnode->args){
         darr_push(args, yap_build_func_arg(src, &arg_node));
     }
