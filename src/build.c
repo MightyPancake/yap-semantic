@@ -1679,9 +1679,14 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
     unsigned int expected_count = darr_len(expected_args);
     unsigned int provided_count = darr_len(call->params);
 
+    /* A trailing yExprList param may be omitted entirely at the call site
+     * (e.g. `print:(c"hi")` instead of `print:(c"hi", [])`) — it then
+     * defaults to an empty list, so arg_ptrs must have room for it even
+     * when provided_count is one short. */
+    unsigned int alloc_count = (provided_count > expected_count) ? provided_count : expected_count;
     void** arg_ptrs = NULL;
-    if (provided_count > 0)
-        arg_ptrs = calloc(provided_count, sizeof(void*));
+    if (alloc_count > 0)
+        arg_ptrs = calloc(alloc_count, sizeof(void*));
 
     for (unsigned int i = 0; i < provided_count; i++){
         yap_macro_param_node* param = &call->params[i];
@@ -1716,9 +1721,20 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
                     arg_ptrs[i] = (void*)built.literal.text;
                 } else if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_bool){
                     arg_ptrs[i] = (void*)(uintptr_t)(strus_eq(built.literal.text, "true") ? 1 : 0);
+                } else if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_blob){
+                    /* A blob literal `[a, b, c]` is built (yap_build_blob below in
+                     * the literal-build path) as a darr(yap_expr) of already
+                     * type-checked elements — exactly what yExprList wraps, so a
+                     * blob is the natural way to pass a variable number of values
+                     * through one fixed-arity macro call argument. */
+                    yap_expr_list* list = yap_ctx_one(ctx, yap_expr_list);
+                    list->items = built.literal.blob.elements;
+                    list->count = built.literal.blob.field_count;
+                    list->cap = built.literal.blob.field_count;
+                    arg_ptrs[i] = list;
                 } else {
                     yap_build_push_error(src, param->loc,
-                        "Comptime call argument must be a literal (use #expr to pass as AST node)");
+                        "Comptime call argument must be a literal (use #expr to pass as AST node, or [..] for a yExprList)");
                     free(arg_ptrs); return NULL;
                 }
                 break;
@@ -1769,10 +1785,18 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
     }
 
     if (provided_count != expected_count){
-        yap_build_push_error(src, call->loc,
-            "Macro argument count mismatch: expected %u, got %u",
-            expected_count, provided_count);
-        free(arg_ptrs); return NULL;
+        bool defaulted_empty_list = expected_count > 0
+            && provided_count == expected_count - 1
+            && expected_args[expected_count - 1] == ctx->yexprlist_type_id;
+        if (defaulted_empty_list){
+            arg_ptrs[expected_count - 1] = yap_ctx_one_cpy(ctx, ((yap_expr_list){0}));
+            provided_count = expected_count;
+        } else {
+            yap_build_push_error(src, call->loc,
+                "Macro argument count mismatch: expected %u, got %u",
+                expected_count, provided_count);
+            free(arg_ptrs); return NULL;
+        }
     }
 
     if (!ctx->ensure_symbol){
