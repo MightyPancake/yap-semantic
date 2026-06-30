@@ -782,6 +782,8 @@ yap_expr yap_build_expr(yap_source* src, yap_expr_node* node){
         case yap_expr_decrement:     ret = yap_build_decrement_expr(src, node->decrement.expr); break;
         case yap_expr_ternary:       ret = yap_build_ternary_expr(src, &node->ternary);         break;
         case yap_expr_member_access: ret = yap_build_member_access_expr(src, &node->member_access); break;
+        case yap_expr_optional_member_access: ret = yap_build_optional_member_access_expr(src, &node->member_access); break;
+        case yap_expr_deref:         ret = yap_build_deref_expr(src, &node->deref);              break;
         case yap_expr_index_access:  ret = yap_build_index_access_expr(src, &node->index_access);  break;
         case yap_expr_module_access: ret = yap_build_module_access_expr(src, &node->module_access); break;
         case yap_expr_macro:         ret = yap_build_macro_expr(src, &node->macro_call); break;
@@ -1356,6 +1358,72 @@ yap_expr yap_build_member_access_expr(yap_source* src, yap_member_access_node* m
         .type        = member_type,
         .is_lvalue   = object.is_lvalue,
         .is_comptime = object.is_comptime
+    };
+}
+
+// `ptr?.member`: only valid on a pointer to struct/union. When `ptr` is
+// null at runtime, evaluates to the zero value of `member`'s type instead
+// of dereferencing (there's no Optional<T> in yap to propagate, so a zero
+// value is the fallback - chosen so the result keeps the same type as plain
+// `.member` access, letting `?.` chains keep type-checking normally).
+yap_expr yap_build_optional_member_access_expr(yap_source* src, yap_member_access_node* ma){
+    yap_ctx* ctx = src->ctx;
+
+    yap_expr object = yap_build_expr(src, ma->object);
+    if (object.kind == yap_expr_error) return (yap_expr){ .kind = yap_expr_error };
+
+    yap_type* obj_type = yap_ctx_get_type(ctx, object.type);
+    if (!obj_type || obj_type->kind != yap_type_ptr){
+        yap_build_push_error(src, ma->loc, "Optional chaining ('?.') requires a pointer type");
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    yap_type* pointee_type = yap_ctx_get_type(ctx, obj_type->pointer_type);
+    if (!pointee_type || (pointee_type->kind != yap_type_struct && pointee_type->kind != yap_type_union)){
+        yap_build_push_error(src, ma->loc, "Optional chaining ('?.') requires a pointer to struct or union");
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    yap_type_id member_type = yap_ctx_find_member_type(ctx, obj_type->pointer_type, ma->member.value);
+    if (member_type == ctx->internal_error_type_id){
+        yap_build_push_error(src, ma->loc,
+            "Type has no member named '%s'", ma->member.value);
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    return (yap_expr){
+        .kind          = yap_expr_optional_member_access,
+        .member_access = (yap_member_access){
+            .object = yap_ctx_one_cpy(ctx, object),
+            .member = ma->member.value
+        },
+        .type        = member_type,
+        .is_lvalue   = false,
+        .is_comptime = false
+    };
+}
+
+// `expr.`: unchecked dereference, works on any pointer type. Unlike `?.`,
+// this is the raw/unsafe deref (matching C's *ptr - UB on null), since `?.`
+// already exists as the null-checked alternative for struct field access.
+yap_expr yap_build_deref_expr(yap_source* src, yap_deref_node* dn){
+    yap_ctx* ctx = src->ctx;
+
+    yap_expr expr = yap_build_expr(src, dn->expr);
+    if (expr.kind == yap_expr_error) return (yap_expr){ .kind = yap_expr_error };
+
+    yap_type* obj_type = yap_ctx_get_type(ctx, expr.type);
+    if (!obj_type || obj_type->kind != yap_type_ptr){
+        yap_build_push_error(src, dn->loc, "Cannot dereference a non-pointer type");
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    return (yap_expr){
+        .kind        = yap_expr_deref,
+        .subexpr     = yap_ctx_one_cpy(ctx, expr),
+        .type        = obj_type->pointer_type,
+        .is_lvalue   = true,
+        .is_comptime = false
     };
 }
 
