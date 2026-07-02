@@ -1,5 +1,7 @@
 #include "yap_semantic.h"
 #include "build.h"
+#include <float.h>
+#include <stdint.h>
 
 static yap_expr yap_build_blob_cast(yap_source* src, yap_expr blob_expr, yap_type_id target_type, yap_loc loc);
 static yap_expr yap_build_macro_expr(yap_source* src, yap_macro_call_node* call);
@@ -615,6 +617,78 @@ yap_statement yap_build_expr_statement(yap_source* src, yap_expr_node* expr_node
     return (yap_statement){ .kind = yap_statement_expr, .expr = e };
 }
 
+// Range-checks a literal (or a unary-minus-negated literal, to get INT_MIN-
+// style magnitudes right) against a concrete target type, at the two places
+// an untyped literal meets a known concrete type: var-decl initializers and
+// assignments. yap_ctx_type_id_assignable only checks type-kind
+// compatibility, never magnitude, so this is the one place a literal's
+// actual value gets validated against the width it's landing in (e.g.
+// 'i32 x = 0xFFFFFFFF;' is now rejected instead of silently truncating).
+static bool yap_check_literal_range(yap_source* src, yap_loc loc, yap_expr expr, yap_type_id target_type_id){
+    yap_ctx* ctx = src->ctx;
+
+    bool negated = false;
+    if (expr.kind == yap_expr_unary){
+        negated = true;
+        expr = *expr.subexpr;
+    }
+    if (expr.kind != yap_expr_literal || expr.literal.kind != yap_literal_numerical)
+        return true;
+
+    yap_type* target = yap_ctx_get_type(ctx, yap_ctx_coerce_type_id_to_id(ctx, target_type_id));
+    if (!target || target->kind != yap_type_primitive)
+        return true;
+
+    char* text = expr.literal.text;
+    bool is_float_lit = strchr(text, '.') != NULL || strchr(text, 'e') != NULL || strchr(text, 'E') != NULL;
+
+    if (target->primitive.is_float){
+        double d = strtod(text, NULL);
+        double max = target->primitive.bytes == 4 ? (double)FLT_MAX : DBL_MAX;
+        if (d > max){
+            yap_build_push_error(src, loc, "Numeric literal '%s%s' overflows type '%s'",
+                negated ? "-" : "", text, target->primitive.name);
+            return false;
+        }
+        return true;
+    }
+
+    if (is_float_lit){
+        yap_build_push_error(src, loc, "Cannot use a fractional literal '%s%s' as integer type '%s'",
+            negated ? "-" : "", text, target->primitive.name);
+        return false;
+    }
+
+    unsigned long long mag = strtoull(text, NULL, 10);
+    int bits = (int)(target->primitive.bytes * 8);
+
+    if (!target->primitive.is_signed){
+        if (negated){
+            if (mag != 0){
+                yap_build_push_error(src, loc, "Cannot assign negative literal '-%s' to unsigned type '%s'",
+                    text, target->primitive.name);
+                return false;
+            }
+            return true;
+        }
+        unsigned long long max = (bits >= 64) ? UINT64_MAX : ((1ULL << bits) - 1ULL);
+        if (mag > max){
+            yap_build_push_error(src, loc, "Numeric literal '%s' overflows type '%s'", text, target->primitive.name);
+            return false;
+        }
+        return true;
+    }
+
+    unsigned long long max_pos = (1ULL << (bits - 1)) - 1ULL;
+    unsigned long long limit = negated ? max_pos + 1ULL : max_pos;
+    if (mag > limit){
+        yap_build_push_error(src, loc, "Numeric literal '%s%s' overflows type '%s'",
+            negated ? "-" : "", text, target->primitive.name);
+        return false;
+    }
+    return true;
+}
+
 yap_statement yap_build_var_decl_statement(yap_source* src, yap_var_decl_node* vnode){
     yap_ctx* ctx = src->ctx;
     yap_var var = {0};
@@ -651,6 +725,8 @@ yap_statement yap_build_var_decl_statement(yap_source* src, yap_var_decl_node* v
                     lhs_str, rhs_str);
                 free(rhs_str);
                 free(lhs_str);
+                return (yap_statement){ .kind = yap_statement_error };
+            } else if (!yap_check_literal_range(src, vnode->loc, init, declared_type)){
                 return (yap_statement){ .kind = yap_statement_error };
             }
         }
@@ -843,6 +919,7 @@ yap_expr yap_build_expr(yap_source* src, yap_expr_node* node){
         case yap_expr_literal:       ret = yap_build_literal_expr(src, &node->literal);        break;
         case yap_expr_var:           ret = yap_build_var_access_expr(src, &node->var);          break;
         case yap_expr_bin:           ret = yap_build_bin_expr(src, &node->bin);                break;
+        case yap_expr_unary:         ret = yap_build_unary_expr(src, &node->unary);            break;
         case yap_expr_assignment:    ret = yap_build_assignment_expr(src, &node->assignment);   break;
         case yap_expr_func_call:     ret = yap_build_func_call_expr(src, &node->func_call);     break;
         case yap_expr_cast:          ret = yap_build_cast_expr(src, &node->cast);              break;
@@ -956,8 +1033,13 @@ yap_expr yap_build_literal_expr(yap_source* src, yap_literal_node* lit){
 
     switch (lit->kind){
         case yap_literal_numerical: {
-            // Detect float literals (contain a '.') vs integer literals
-            bool is_float = strchr(lit->numerical, '.') != NULL;
+            // Detect float literals (contain a '.' or an exponent marker) vs
+            // integer literals -- hex/octal/binary integers were already
+            // normalized to plain decimal text by the parser, so a bare 'e'
+            // here can only be a decimal exponent, never a hex digit.
+            bool is_float = strchr(lit->numerical, '.') != NULL
+                || strchr(lit->numerical, 'e') != NULL
+                || strchr(lit->numerical, 'E') != NULL;
             res.type = is_float ? ctx->untyped_float_type_id : ctx->untyped_int_type_id;
             res.literal = (yap_literal){ .kind = yap_literal_numerical, .text = lit->numerical };
             break;
@@ -1089,6 +1171,30 @@ yap_expr yap_build_bin_expr(yap_source* src, yap_bin_op_node* bin){
     };
 }
 
+yap_expr yap_build_unary_expr(yap_source* src, yap_unary_op_node* un){
+    yap_ctx* ctx = src->ctx;
+    yap_expr expr = yap_build_expr(src, un->expr);
+    if (expr.kind == yap_expr_error)
+        return (yap_expr){ .kind = yap_expr_error };
+
+    yap_type_id coerced = yap_ctx_coerce_type_id_to_id(ctx, expr.type);
+    yap_type* operand_type = yap_ctx_get_type(ctx, coerced);
+    bool is_numeric = operand_type && operand_type->kind == yap_type_primitive
+        && !yap_ctx_type_ids_eq(ctx, coerced, ctx->bool_type_id);
+    if (!is_numeric){
+        yap_build_push_error(src, un->loc, "Operand of unary '-' must be a numeric type");
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    return (yap_expr){
+        .kind        = yap_expr_unary,
+        .subexpr     = yap_ctx_one_cpy(ctx, expr),
+        .type        = expr.type,
+        .is_lvalue   = false,
+        .is_comptime = expr.is_comptime
+    };
+}
+
 yap_expr yap_build_assignment_expr(yap_source* src, yap_assignment_node* assign){
     yap_ctx* ctx = src->ctx;
 
@@ -1120,6 +1226,9 @@ yap_expr yap_build_assignment_expr(yap_source* src, yap_assignment_node* assign)
         free(lhs_str);
         return (yap_expr){ .kind = yap_expr_error };
     }
+
+    if (!yap_check_literal_range(src, assign->loc, right, left.type))
+        return (yap_expr){ .kind = yap_expr_error };
 
     yap_assignment a = {
         .kind  = yap_assignment_valid,
@@ -1986,8 +2095,14 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
 
     if (provided_count != expected_count){
         yap_type* last_expected = (expected_count > 0) ? yap_ctx_get_type(ctx, expected_args[expected_count - 1]) : NULL;
-        bool last_is_yexprlist_ptr = last_expected && last_expected->kind == yap_type_ptr
-            && last_expected->pointer_type == ctx->yexprlist_type_id;
+        // Structural check (element type, not type_id) so a trailing param
+        // spelled 'yExpr[]@' is recognized the same as 'yExprList@' -- both
+        // resolve to the identical anonymous slice-of-yExpr type underneath,
+        // and only the named 'yExprList' alias carries ctx->yexprlist_type_id.
+        yap_type* last_pointee = (last_expected && last_expected->kind == yap_type_ptr)
+            ? yap_ctx_get_type(ctx, last_expected->pointer_type) : NULL;
+        bool last_is_yexprlist_ptr = last_pointee && last_pointee->kind == yap_type_slice
+            && last_pointee->slice.element_type == ctx->yexpr_type_id;
         bool defaulted_empty_list = expected_count > 0
             && provided_count == expected_count - 1
             && last_is_yexprlist_ptr;

@@ -34,6 +34,7 @@ yap_expr yap_build_expr(yap_source* src, yap_expr_node* node);
 yap_expr yap_build_literal_expr(yap_source* src, yap_literal_node* lit);
 yap_expr yap_build_var_access_expr(yap_source* src, yap_identifier_node* ident);
 yap_expr yap_build_bin_expr(yap_source* src, yap_bin_op_node* bin);
+yap_expr yap_build_unary_expr(yap_source* src, yap_unary_op_node* un);
 yap_expr yap_build_assignment_expr(yap_source* src, yap_assignment_node* assign);
 yap_expr yap_build_func_call_expr(yap_source* src, yap_func_call_node* call);
 yap_expr yap_build_cast_expr(yap_source* src, yap_cast_node* cast);
