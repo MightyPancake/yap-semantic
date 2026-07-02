@@ -870,6 +870,86 @@ yap_expr yap_build_expr(yap_source* src, yap_expr_node* node){
     return ret;
 }
 
+/* Function literal: desugar to a hoisted, static, top-level C function --
+ * same shape as ct_func_finish (yap-c/build_state.c), but triggered from
+ * ordinary expression building instead of a comptime yapi call. The literal
+ * is capture-free by design: its body scope is parented to the *global*
+ * scope, not the enclosing function's, so referencing an enclosing local is
+ * an "Undefined variable" error at yap level rather than broken C output.
+ * The expression's value is just a var reference to the hoisted name (C
+ * auto-decays a function name to its pointer). */
+static yap_expr yap_build_func_literal_expr(yap_source* src, yap_func_literal_node* fnode){
+    yap_ctx* ctx = src->ctx;
+
+    yap_type_id return_type = ctx->void_type_id;
+    if (fnode->has_return_type && fnode->return_type_node){
+        return_type = yap_build_type_from_type_node(src, fnode->return_type_node);
+        if (!return_type){
+            yap_build_push_error(src, fnode->return_type_node->loc,
+                "Invalid return type in function literal");
+            return (yap_expr){ .kind = yap_expr_error };
+        }
+    }
+
+    darr(yap_func_arg) args = yap_ctx_darr_new(ctx, yap_func_arg,
+        .cap = darr_len(fnode->args), .len = 0);
+    darr(yap_type_id) arg_type_ids = yap_ctx_darr_new(ctx, yap_type_id,
+        .cap = darr_len(fnode->args), .len = 0);
+    for_darr(ai, arg_node, fnode->args){
+        yap_func_arg arg = yap_build_func_arg(src, &arg_node);
+        if (arg.kind != yap_func_arg_valid)
+            return (yap_expr){ .kind = yap_expr_error };
+        darr_push(args, arg);
+        darr_push(arg_type_ids, arg.type);
+    }
+
+    yap_type func_type = {
+        .kind     = yap_type_func,
+        .func     = { .args = arg_type_ids, .return_type = return_type },
+        .is_const = false
+    };
+    yap_type_id func_type_id = yap_ctx_insert_type_if_not_exists(ctx, func_type);
+
+    char* emit_name = yap_ctx_get_anon_name(ctx, "func", ctx->anon_id++);
+    yap_scope_set_var(ctx->global_scope, (yap_var){ .name = emit_name, .type = func_type_id });
+
+    yap_scope* func_scope = yap_ctx_new_scope(ctx, ctx->global_scope);
+    darr_push(ctx->current_scopes, func_scope);
+    for_darr(ai, arg, args){
+        yap_scope_set_var(func_scope, (yap_var){ .name = arg.name, .type = arg.type });
+    }
+    yap_block body = yap_build_block(src, &fnode->body);
+    yap_ctx_pop_scope(ctx);
+    if (body.kind == yap_block_error)
+        return (yap_expr){ .kind = yap_expr_error };
+
+    yap_decl decl = {
+        .kind      = yap_decl_func_def,
+        .func_decl = (yap_func_decl){
+            .name    = emit_name,
+            .args    = args,
+            .ret_typ = return_type,
+            .body    = body
+        },
+        .loc = fnode->loc,
+        // Explicit, not left to fall back to ctx->current_module->prefix --
+        // the emitted name is already unique and the call site references it
+        // unprefixed (see ct_func_finish for the same reasoning).
+        .module_prefix = "",
+    };
+    if (ctx->gen_decl)
+        ctx->gen_decl(ctx, decl);
+    yap_log("Hoisted function literal as '%s'", emit_name);
+
+    return (yap_expr){
+        .kind        = yap_expr_var,
+        .var_name    = emit_name,
+        .type        = func_type_id,
+        .is_lvalue   = false,
+        .is_comptime = false
+    };
+}
+
 yap_expr yap_build_literal_expr(yap_source* src, yap_literal_node* lit){
     yap_ctx* ctx = src->ctx;
     yap_expr res = { .kind = yap_expr_literal, .is_comptime = true, .is_lvalue = false };
@@ -908,6 +988,8 @@ yap_expr yap_build_literal_expr(yap_source* src, yap_literal_node* lit){
             res.type = ctx->void_type_id;  // null is a void pointer-like value
             res.literal = (yap_literal){ .kind = yap_literal_null, .text = "0" };
             break;
+        case yap_literal_func:
+            return yap_build_func_literal_expr(src, &lit->func_literal);
         case yap_literal_blob: {
             unsigned int count = darr_len(lit->blob_elements);
             darr(yap_expr) elements = yap_ctx_darr_new(ctx, yap_expr, .cap = count, .len = 0);
@@ -2111,7 +2193,7 @@ yap_type_id yap_build_type_from_type_node(yap_source* src, yap_type_node* tnode)
             for_darr(fi, fv, tnode->anon_struct.fields){
                 darr_push(fields, yap_build_struct_field(src, &fv));
             }
-            yap_anon_id anon_id = src->anon_id++;
+            yap_anon_id anon_id = ctx->anon_id++;
             char* c_name = yap_ctx_get_anon_name(ctx, "struct", anon_id);
             yap_type t = {
                 .kind = yap_type_struct,
@@ -2127,7 +2209,7 @@ yap_type_id yap_build_type_from_type_node(yap_source* src, yap_type_node* tnode)
             for_darr(vi, ev, tnode->anon_enum.variants){
                 darr_push(variants, yap_build_enum_variant(src, &ev));
             }
-            yap_anon_id anon_id = src->anon_id++;
+            yap_anon_id anon_id = ctx->anon_id++;
             char* c_name = yap_ctx_get_anon_name(ctx, "enum", anon_id);
             yap_type t = {
                 .kind = yap_type_enum,
@@ -2143,7 +2225,7 @@ yap_type_id yap_build_type_from_type_node(yap_source* src, yap_type_node* tnode)
             for_darr(vi, uv, tnode->anon_union.variants){
                 darr_push(variants, yap_build_struct_field(src, &uv));
             }
-            yap_anon_id anon_id = src->anon_id++;
+            yap_anon_id anon_id = ctx->anon_id++;
             char* c_name = yap_ctx_get_anon_name(ctx, "union", anon_id);
             yap_type t = {
                 .kind = yap_type_union,
