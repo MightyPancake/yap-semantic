@@ -1069,6 +1069,11 @@ static yap_expr yap_build_method_callee(yap_source* src, yap_method_access_node*
         if (recv_type->kind == yap_type_struct) owner_name = recv_type->structure.name;
         else if (recv_type->kind == yap_type_union) owner_name = recv_type->uni.name;
         else if (recv_type->kind == yap_type_enum) owner_name = recv_type->enumeration.name;
+        /* Builtin opaque comptime types (yType, yStructT, yFuncT, ...) have no nominal
+         * struct/union/enum name but can still have builtin methods registered under
+         * "PrimitiveName_methodname" (see ctx.c) -- fall back to the primitive's own
+         * declared name. Harmless for every other primitive since none has methods. */
+        else if (recv_type->kind == yap_type_primitive) owner_name = recv_type->primitive.name;
     }
     if (!owner_name || !owner_name[0]){
         char* type_str = yap_ctx_type_id_to_string(ctx, receiver.type);
@@ -1125,14 +1130,33 @@ yap_expr yap_build_func_call_expr(yap_source* src, yap_func_call_node* call){
 
     if (is_method_call){
         if (darr_len(expected_args) > 0 && !yap_ctx_type_id_compatible(ctx, receiver.type, expected_args[0])){
-            char* expected_str = yap_ctx_type_id_to_string(ctx, expected_args[0]);
-            char* actual_str   = yap_ctx_type_id_to_string(ctx, receiver.type);
-            yap_build_push_error(src, call->loc,
-                "Receiver type mismatch for method '%s': expected '%s', got '%s'",
-                call->func->method_access.name.value, expected_str, actual_str);
-            free(expected_str);
-            free(actual_str);
-            return (yap_expr){ .kind = yap_expr_error };
+            /* Pointer-receiver method (subject type is 'T@'): auto-take-address of an
+             * lvalue receiver of type 'T', same as Go/C++ implicit &this binding, so
+             * mutating methods (e.g. a growable array's push()) can write back to the
+             * caller's variable without the caller writing '&a:push(x)' by hand. */
+            yap_type* expected_t = yap_ctx_get_type(ctx, expected_args[0]);
+            yap_type* receiver_t = yap_ctx_get_type(ctx, receiver.type);
+            yap_type* pointee_t  = (expected_t && expected_t->kind == yap_type_ptr)
+                ? yap_ctx_get_type(ctx, expected_t->pointer_type) : NULL;
+            bool auto_ref = pointee_t && receiver_t && receiver.is_lvalue
+                && yap_ctx_types_eq(ctx, *pointee_t, *receiver_t);
+            if (auto_ref){
+                receiver = (yap_expr){
+                    .kind      = yap_expr_at_op,
+                    .subexpr   = yap_ctx_one_cpy(ctx, receiver),
+                    .type      = expected_args[0],
+                    .is_lvalue = false
+                };
+            } else {
+                char* expected_str = yap_ctx_type_id_to_string(ctx, expected_args[0]);
+                char* actual_str   = yap_ctx_type_id_to_string(ctx, receiver.type);
+                yap_build_push_error(src, call->loc,
+                    "Receiver type mismatch for method '%s': expected '%s', got '%s'",
+                    call->func->method_access.name.value, expected_str, actual_str);
+                free(expected_str);
+                free(actual_str);
+                return (yap_expr){ .kind = yap_expr_error };
+            }
         }
         darr_push(params, receiver);
     }
@@ -1474,6 +1498,38 @@ yap_expr yap_build_member_access_expr(yap_source* src, yap_member_access_node* m
     if (object.kind == yap_expr_error) return (yap_expr){ .kind = yap_expr_error };
 
     yap_type* obj_type = yap_ctx_get_type(ctx, object.type);
+
+    /* Slices (e.g. string literals, yExprList) codegen to a real
+     * 'struct { T* data; unsigned long len; }' (yap_gen_name_type_combo's
+     * yap_type_slice case) -- expose those two fields directly rather than
+     * requiring a builder/method for something that's already a plain
+     * struct at the C level. */
+    if (obj_type && obj_type->kind == yap_type_slice){
+        if (ma->member.value && strcmp(ma->member.value, "len") == 0){
+            yap_type_id u64_id = yap_ctx_get_type_id_by_name(ctx, "u64");
+            return (yap_expr){
+                .kind          = yap_expr_member_access,
+                .member_access = { .object = yap_ctx_one_cpy(ctx, object), .member = ma->member.value },
+                .type        = u64_id,
+                .is_lvalue   = false,
+                .is_comptime = object.is_comptime
+            };
+        }
+        if (ma->member.value && strcmp(ma->member.value, "data") == 0){
+            yap_type_id ptr_id = yap_ctx_get_pointer_of_type_id(ctx, obj_type->slice.element_type);
+            return (yap_expr){
+                .kind          = yap_expr_member_access,
+                .member_access = { .object = yap_ctx_one_cpy(ctx, object), .member = ma->member.value },
+                .type        = ptr_id,
+                .is_lvalue   = object.is_lvalue,
+                .is_comptime = object.is_comptime
+            };
+        }
+        yap_build_push_error(src, ma->loc,
+            "Slice has no member named '%s' (only 'len' and 'data')", ma->member.value);
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
     if (!obj_type || (obj_type->kind != yap_type_struct && obj_type->kind != yap_type_union)){
         yap_build_push_error(src, ma->loc, "Member access requires struct or union type");
         return (yap_expr){ .kind = yap_expr_error };
@@ -1684,6 +1740,17 @@ static bool yap_is_comptime_type(yap_ctx* ctx, yap_type_id id){
         || id == ctx->void_type_id;
 }
 
+/* Matches yap_gen_name_type_combo's yap_type_slice codegen exactly
+ * ('struct { T* data; unsigned long len; }') -- the runtime shape a real
+ * yap-level slice value has once compiled. Macro-call args are marshalled to
+ * TCC through a uniform void*-per-slot dispatch (see the switch at the
+ * bottom of this function), which can only ever pass one pointer-sized
+ * value per slot -- a genuine 2-word by-value slice can't cross that
+ * boundary directly, so blob-literal ([a,b,c]) args build one of these on
+ * the arena and pass its *address*, and the callee's declared param type
+ * must be a pointer to the slice (e.g. 'yExprList@'), not the slice itself. */
+typedef struct { void* data; unsigned long len; } yap_yexpr_slice;
+
 static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap_type_id* out_ret_type){
     yap_ctx* ctx = src->ctx;
     *out_ret_type = 0;
@@ -1763,14 +1830,26 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
                 } else if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_blob){
                     /* A blob literal `[a, b, c]` is built (yap_build_blob below in
                      * the literal-build path) as a darr(yap_expr) of already
-                     * type-checked elements — exactly what yExprList wraps, so a
-                     * blob is the natural way to pass a variable number of values
-                     * through one fixed-arity macro call argument. */
-                    yap_expr_list* list = yap_ctx_one(ctx, yap_expr_list);
-                    list->items = built.literal.blob.elements;
-                    list->count = built.literal.blob.field_count;
-                    list->cap = built.literal.blob.field_count;
-                    arg_ptrs[i] = list;
+                     * type-checked elements — a contiguous array of *structs*.
+                     * A yExpr value is an 8-byte opaque handle (a pointer to one
+                     * such struct, per its "void*" c_name), so the slice's data
+                     * array must hold one pointer per element, not the structs
+                     * themselves — build that indirection here. Built as the real
+                     * slice ABI shape (see yap_yexpr_slice) and passed by
+                     * address, since the generic void*-per-slot dispatch below
+                     * can't carry a 2-word by-value struct directly — the
+                     * callee's declared param type must be 'yExprList@', not
+                     * bare 'yExprList'. */
+                    unsigned int blob_count = built.literal.blob.field_count;
+                    yap_expr** elem_ptrs = blob_count
+                        ? (yap_expr**)yap_ctx_one_raw(ctx, sizeof(yap_expr*) * blob_count)
+                        : NULL;
+                    for (unsigned int bi = 0; bi < blob_count; bi++)
+                        elem_ptrs[bi] = &built.literal.blob.elements[bi];
+                    yap_yexpr_slice* slice = yap_ctx_one(ctx, yap_yexpr_slice);
+                    slice->data = elem_ptrs;
+                    slice->len  = blob_count;
+                    arg_ptrs[i] = slice;
                 } else {
                     yap_build_push_error(src, param->loc,
                         "Comptime call argument must be a literal (use #expr to pass as AST node, or [..] for a yExprList)");
@@ -1824,11 +1903,14 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
     }
 
     if (provided_count != expected_count){
+        yap_type* last_expected = (expected_count > 0) ? yap_ctx_get_type(ctx, expected_args[expected_count - 1]) : NULL;
+        bool last_is_yexprlist_ptr = last_expected && last_expected->kind == yap_type_ptr
+            && last_expected->pointer_type == ctx->yexprlist_type_id;
         bool defaulted_empty_list = expected_count > 0
             && provided_count == expected_count - 1
-            && expected_args[expected_count - 1] == ctx->yexprlist_type_id;
+            && last_is_yexprlist_ptr;
         if (defaulted_empty_list){
-            arg_ptrs[expected_count - 1] = yap_ctx_one_cpy(ctx, ((yap_expr_list){0}));
+            arg_ptrs[expected_count - 1] = yap_ctx_one_cpy(ctx, ((yap_yexpr_slice){0}));
             provided_count = expected_count;
         } else {
             yap_build_push_error(src, call->loc,
