@@ -589,7 +589,7 @@ yap_statement yap_build_expr_statement(yap_source* src, yap_expr_node* expr_node
                 yap_build_push_error(src, expr_node->loc, "Macro returned NULL");
             return (yap_statement){ .kind = yap_statement_error };
         }
-        if (ret_type_id == ctx->ystatement_type_id){
+        if (ret_type_id == ctx->ystmt_type_id){
             yap_statement* expanded = (yap_statement*)result;
             yap_log("Macro expanded to statement (kind=%d)", expanded->kind);
             yap_statement ret = *expanded;
@@ -1051,6 +1051,95 @@ static yap_expr yap_build_blueprint_expr(yap_source* src, yap_blueprint_node* bp
 }
 
 /* ----------------------------------------------------------------
+ *  Type blueprints — the eager type${ struct/enum/union {...} } quasi-quote
+ *
+ *  Model A: sugar over the *construction* phase only. The body desugars into a
+ *  chained yapi->struct_t()/union_t()/enum_t() + add_field/add_variant call that
+ *  evaluates to a yStructT/yEnumT/yUnionT template — you then :finish("name") it
+ *  yourself (naming/hash/dedup/existed/methods all stay on the existing API).
+ *  Eager: $T in a field/variant type splices the in-scope comptime yType now.
+ * ---------------------------------------------------------------- */
+
+// base:method(args...) as a parse node (one link of a builder method chain).
+static yap_expr_node bp_method_call(yap_source* src, yap_expr_node base, const char* method,
+                                    yap_expr_node* args, int argc, yap_loc loc){
+    yap_ctx* ctx = src->ctx;
+    yap_expr_node callee = { .kind = yap_expr_method_access,
+        .method_access = { .caller = yap_ctx_one_cpy(ctx, base),
+                           .name = { .value = (char*)method, .loc = loc }, .loc = loc }, .loc = loc };
+    darr(yap_expr_node) argd = yap_ctx_darr_new(ctx, yap_expr_node, .cap = argc, .len = 0);
+    for (int i = 0; i < argc; i++) darr_push(argd, args[i]);
+    return (yap_expr_node){ .kind = yap_expr_func_call,
+        .func_call = { .func = yap_ctx_one_cpy(ctx, callee), .args = argd, .loc = loc },
+        .loc = loc };
+}
+
+// Recursively desugar a field/variant type node into the yExpr that yields its
+// yType at comptime. $T (hole) -> eager splice of the in-scope comptime yType;
+// a named type -> yapi->type(c"name"). Pointer/slice/anon-type fields are an
+// extension point (recurse here later for embedded/anon types) — for now a clear error.
+static yap_expr_node bp_type_to_yexpr(yap_source* src, yap_type_node* t, bool* ok){
+    yap_ctx* ctx = src->ctx;
+    yap_loc loc = t ? t->loc : (yap_loc){0};
+    if (!t){ *ok = false; return (yap_expr_node){ .kind = yap_expr_error, .loc = loc }; }
+    switch (t->kind){
+        case yap_type_node_blueprint_hole:
+            return (yap_expr_node){ .kind = yap_expr_var,
+                .var = { .value = yap_ctx_strus_cpy(ctx, t->identifier.value), .loc = loc }, .loc = loc };
+        case yap_type_node_identifier: {
+            yap_expr_node arg = bp_cstr_node(src, yap_ctx_strus_cpy(ctx, t->identifier.value), loc);
+            return bp_yapi_call(src, "type", &arg, 1, loc);
+        }
+        default:
+            *ok = false;
+            yap_build_push_error(src, loc, "unsupported field type in type blueprint (first cut: identifier types and $holes; pointer/slice/anon types are an extension point)");
+            return (yap_expr_node){ .kind = yap_expr_error, .loc = loc };
+    }
+}
+
+static yap_expr yap_build_type_blueprint(yap_source* src, yap_type_blueprint_node* tb){
+    yap_ctx* ctx = src->ctx;
+    yap_loc loc = tb->loc;
+    yap_type_node* body = tb->body;
+    if (!body){
+        yap_build_push_error(src, loc, "empty type blueprint");
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+    bool ok = true;
+    yap_expr_node chain;
+    switch (body->kind){
+        case yap_type_node_anon_struct:
+            chain = bp_yapi_call(src, "struct_t", NULL, 0, loc);
+            for_darr(i, f, body->anon_struct.fields){
+                yap_expr_node args[2] = { bp_type_to_yexpr(src, f.type_node, &ok),
+                                          bp_cstr_node(src, yap_ctx_strus_cpy(ctx, f.name.value), loc) };
+                chain = bp_method_call(src, chain, "add_field", args, 2, loc);
+            }
+            break;
+        case yap_type_node_anon_union:
+            chain = bp_yapi_call(src, "union_t", NULL, 0, loc);
+            for_darr(i, f, body->anon_union.variants){
+                yap_expr_node args[2] = { bp_type_to_yexpr(src, f.type_node, &ok),
+                                          bp_cstr_node(src, yap_ctx_strus_cpy(ctx, f.name.value), loc) };
+                chain = bp_method_call(src, chain, "add_field", args, 2, loc);
+            }
+            break;
+        case yap_type_node_anon_enum:
+            chain = bp_yapi_call(src, "enum_t", NULL, 0, loc);
+            for_darr(i, v, body->anon_enum.variants){
+                yap_expr_node nm = bp_cstr_node(src, yap_ctx_strus_cpy(ctx, v.name.value), loc);
+                chain = bp_method_call(src, chain, "add_variant", &nm, 1, loc);
+            }
+            break;
+        default:
+            yap_build_push_error(src, loc, "type blueprint body must be an anonymous struct/enum/union");
+            return (yap_expr){ .kind = yap_expr_error };
+    }
+    if (!ok) return (yap_expr){ .kind = yap_expr_error };
+    return yap_build_expr(src, &chain); // chain types as yStructT/yEnumT/yUnionT via chainable builders
+}
+
+/* ----------------------------------------------------------------
  *  Expressions
  * ---------------------------------------------------------------- */
 
@@ -1078,6 +1167,7 @@ yap_expr yap_build_expr(yap_source* src, yap_expr_node* node){
         case yap_expr_module_access: ret = yap_build_module_access_expr(src, &node->module_access); break;
         case yap_expr_macro:         ret = yap_build_macro_expr(src, &node->macro_call); break;
         case yap_expr_blueprint:     ret = yap_build_blueprint_expr(src, &node->blueprint); break;
+        case yap_expr_type_blueprint: ret = yap_build_type_blueprint(src, &node->type_blueprint); break;
         case yap_expr_blueprint_hole:
             yap_build_push_error(src, node->loc,
                 "blueprint hole '$%s' used outside a $(...) blueprint",
@@ -1407,7 +1497,7 @@ static yap_expr yap_build_method_callee(yap_source* src, yap_method_access_node*
         if (recv_type->kind == yap_type_struct) owner_name = recv_type->structure.name;
         else if (recv_type->kind == yap_type_union) owner_name = recv_type->uni.name;
         else if (recv_type->kind == yap_type_enum) owner_name = recv_type->enumeration.name;
-        /* Builtin opaque comptime types (yType, yStructT, yFuncT, ...) have no nominal
+        /* Builtin opaque comptime types (yType, yStructT, yFnT, ...) have no nominal
          * struct/union/enum name but can still have builtin methods registered under
          * "PrimitiveName_methodname" (see ctx.c) -- fall back to the primitive's own
          * declared name. Harmless for every other primitive since none has methods. */
@@ -2073,8 +2163,8 @@ yap_expr yap_build_module_access_expr(yap_source* src, yap_module_access_node* m
 static bool yap_is_comptime_type(yap_ctx* ctx, yap_type_id id){
     return id == ctx->yexpr_type_id
         || id == ctx->ytype_type_id
-        || id == ctx->ystatement_type_id
-        || id == ctx->yfunc_type_id
+        || id == ctx->ystmt_type_id
+        || id == ctx->yfn_type_id
         || id == ctx->yexprblueprint_type_id
         || id == ctx->void_type_id;
 }
@@ -2116,7 +2206,7 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
     }
     if (!yap_is_comptime_type(ctx, *out_ret_type)){
         yap_build_push_error(src, call->loc,
-            "Macro function must return a comptime type (yExpr, yType, yStatement, yFunc)");
+            "Macro function must return a comptime type (yExpr, yType, yStmt, yFn)");
         return NULL;
     }
 
@@ -2357,9 +2447,9 @@ static yap_expr yap_build_macro_expr(yap_source* src, yap_macro_call_node* call)
         return (yap_expr){ .kind = yap_expr_error };
     }
 
-    if (ret_type_id == ctx->ystatement_type_id){
+    if (ret_type_id == ctx->ystmt_type_id){
         yap_build_push_error(src, call->loc,
-            "Macro returns yStatement but was used in expression position; use it as a statement instead");
+            "Macro returns yStmt but was used in expression position; use it as a statement instead");
         return (yap_expr){ .kind = yap_expr_error };
     }
 
