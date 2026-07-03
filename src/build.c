@@ -44,16 +44,25 @@ static void yap_build_push_error(yap_source* src, yap_loc loc, const char* fmt, 
 
 /*
  * Recursive post-order build: leaves first, deduplicated by origin.
+ *
+ * visited_origins is taken by pointer-to-darr: darr_push can reallocate the
+ * backing buffer, and since the darr handle is a plain pointer passed
+ * through many levels of recursion, a realloc inside a deep call must be
+ * visible to every shallower/sibling frame still holding that handle.
+ * Passing it by value here previously left ancestor frames with a stale
+ * pointer the moment enough origins accumulated to trigger a grow, which
+ * segfaulted (via a dangling-pointer strcmp) once import graphs got large
+ * enough (e.g. importing io + math + arr together).
  */
-static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(char*) visited_origins){
+static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(char*)* visited_origins){
     if (!src || !src->source_node) return;
 
     // Skip if already visited (by origin)
     if (src->origin){
-        for_darr(i, vo, visited_origins){
+        for_darr(i, vo, *visited_origins){
             if (strcmp(vo, src->origin) == 0) return;
         }
-        darr_push(visited_origins, src->origin);
+        darr_push(*visited_origins, src->origin);
     }
 
     // Recurse into file-import children first (leaves before parents)
@@ -92,8 +101,10 @@ static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(char*
         yap_module* src_mod = yap_ctx_get_module(ctx, src->from_module_import);
         if (src_mod && src_mod->prefix && src_mod->prefix[0])
             decl_prefix = src_mod->prefix;
-    } else if (ctx->current_module && ctx->current_module->prefix[0]) {
-        decl_prefix = ctx->current_module->prefix;
+    } else {
+        yap_module* cur_mod = yap_ctx_current_module(ctx);
+        if (cur_mod && cur_mod->prefix[0])
+            decl_prefix = cur_mod->prefix;
     }
     for_darr(j, dnode, snode->declarations){
         yap_decl decl = yap_build_decl(src, &dnode);
@@ -144,7 +155,7 @@ yap_ctx* yap_build(yap_ctx* ctx, yap_args args){
             yap_log("Failed to find source for import (kind=%d)", imp.kind);
             continue;
         }
-        yap_build_source_postorder(ctx, src, visited_origins);
+        yap_build_source_postorder(ctx, src, &visited_origins);
     }
     darr_free(visited_origins);
 
@@ -1113,11 +1124,12 @@ yap_expr yap_build_var_access_expr(yap_source* src, yap_identifier_node* ident){
     }
 
     char* emit_name = var->name;
-    if (ctx->current_module && ctx->current_module->prefix[0]
-        && ctx->current_module->scope
-        && yap_scope_get_var(ctx->current_module->scope, ident->value)
+    yap_module* cur_mod = yap_ctx_current_module(ctx);
+    if (cur_mod && cur_mod->prefix[0]
+        && cur_mod->scope
+        && yap_scope_get_var(cur_mod->scope, ident->value)
         && strcmp(ident->value, "main") != 0) {
-        emit_name = yap_ctx_strus_newf(ctx, "%s%s", ctx->current_module->prefix, var->name);
+        emit_name = yap_ctx_strus_newf(ctx, "%s%s", cur_mod->prefix, var->name);
     }
 
     return (yap_expr){
