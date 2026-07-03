@@ -907,6 +907,150 @@ yap_statement yap_build_block_statement(yap_source* src, yap_block_node* bnode){
 }
 
 /* ----------------------------------------------------------------
+ *  Blueprints — the $(...) quasi-quote literal
+ *
+ *  A blueprint is pure sugar over the yapi-> builder API: $(...) is rewritten
+ *  into ordinary yapi->hole/int/bin_op/... calls (parse nodes) that are built
+ *  normally, so they codegen into the enclosing macro's body and run under TCC
+ *  like any hand-written builder call. The result is stamped yExprBlueprint
+ *  (which shares a C representation with yExpr — both are yap_expr*), so the
+ *  only front-end bridging is this one type override.
+ *
+ *  Filling and finishing are NOT handled here: they are ordinary methods on
+ *  yExprBlueprint (yExprBlueprint_fill / yExprBlueprint_finish, registered in
+ *  ctx.c, implemented in build_state.c) dispatched through the normal
+ *  obj:method(args) path — e.g. $($x+1):fill(c"x", a):finish().
+ * ---------------------------------------------------------------- */
+
+// yapi->NAME(args...) as a parse node.
+static yap_expr_node bp_yapi_call(yap_source* src, const char* name,
+                                  yap_expr_node* args, int argc, yap_loc loc){
+    yap_ctx* ctx = src->ctx;
+    yap_expr_node callee = { .kind = yap_expr_module_access,
+        .module_access = { .module = { .value = (char*)"yapi", .loc = loc },
+                           .field  = { .value = (char*)name,   .loc = loc },
+                           .loc = loc }, .loc = loc };
+    darr(yap_expr_node) argd = yap_ctx_darr_new(ctx, yap_expr_node, .cap = argc, .len = 0);
+    for (int i = 0; i < argc; i++) darr_push(argd, args[i]);
+    return (yap_expr_node){ .kind = yap_expr_func_call,
+        .func_call = { .func = yap_ctx_one_cpy(ctx, callee), .args = argd, .loc = loc },
+        .loc = loc };
+}
+
+// A cstring literal parse node (used for the byte@ name args of hole/fill/var_value).
+static yap_expr_node bp_cstr_node(yap_source* src, char* s, yap_loc loc){
+    return (yap_expr_node){ .kind = yap_expr_literal,
+        .literal = { .kind = yap_literal_cstring, .string = { .value = s, .loc = loc }, .loc = loc },
+        .loc = loc };
+}
+
+// A decimal integer literal parse node.
+static yap_expr_node bp_int_node(yap_source* src, long v, yap_loc loc){
+    yap_ctx* ctx = src->ctx;
+    return (yap_expr_node){ .kind = yap_expr_literal,
+        .literal = { .kind = yap_literal_numerical, .numerical = yap_ctx_strus_newf(ctx, "%ld", v), .loc = loc },
+        .loc = loc };
+}
+
+// Rewrite a blueprint template expr into the yapi-> builder call that rebuilds
+// it. Supports literals, variable refs, holes, parens, unary minus, ternary,
+// and binary arithmetic + comparison ops. Anything else (calls, member/index,
+// casts, ...) is a clear error rather than a silent miscompile.
+static yap_expr_node bp_desugar_template(yap_source* src, yap_expr_node* t, bool* ok){
+    yap_ctx* ctx = src->ctx;
+    yap_loc loc = t->loc;
+    switch (t->kind){
+        case yap_expr_blueprint_hole: {
+            yap_expr_node arg = bp_cstr_node(src, yap_ctx_strus_cpy(ctx, t->blueprint_hole.name.value), loc);
+            return bp_yapi_call(src, "hole", &arg, 1, loc);
+        }
+        case yap_expr_var: {
+            yap_expr_node arg = bp_cstr_node(src, yap_ctx_strus_cpy(ctx, t->var.value), loc);
+            return bp_yapi_call(src, "var_value", &arg, 1, loc);
+        }
+        case yap_expr_paren:
+            return bp_desugar_template(src, t->paren.expr, ok);
+        case yap_expr_unary: {
+            // prefix '-' — the only unary the parser produces today
+            yap_expr_node inner = bp_desugar_template(src, t->unary.expr, ok);
+            return bp_yapi_call(src, "neg", &inner, 1, loc);
+        }
+        case yap_expr_ternary: {
+            yap_expr_node c  = bp_desugar_template(src, t->ternary.condition, ok);
+            yap_expr_node th = bp_desugar_template(src, t->ternary.then_expr, ok);
+            yap_expr_node el = bp_desugar_template(src, t->ternary.else_expr, ok);
+            yap_expr_node args[3] = { c, th, el };
+            return bp_yapi_call(src, "ternary", args, 3, loc);
+        }
+        case yap_expr_literal: {
+            yap_expr_node arg = *t;
+            switch (t->literal.kind){
+                case yap_literal_numerical: {
+                    bool is_float = strchr(t->literal.numerical, '.')
+                        || strchr(t->literal.numerical, 'e') || strchr(t->literal.numerical, 'E');
+                    return bp_yapi_call(src, is_float ? "float" : "int", &arg, 1, loc);
+                }
+                case yap_literal_string:  return bp_yapi_call(src, "string", &arg, 1, loc);
+                case yap_literal_bool:    return bp_yapi_call(src, "bool",   &arg, 1, loc);
+                default:
+                    *ok = false;
+                    yap_build_push_error(src, loc, "unsupported literal kind in blueprint (first cut supports numbers, strings, bools)");
+                    return arg;
+            }
+        }
+        case yap_expr_bin: {
+            // The parse-AST op is a single char: arithmetic ops keep their ASCII
+            // value (which equals the semtree op enum), while comparisons were
+            // remapped by the parser (== -> 'e', != -> 'n', <= -> 'l', >= -> 'g',
+            // < -> '<', > -> '>'). yapi->bin_op wants the *semtree* op enum, so
+            // translate here.
+            int sem_op;
+            switch (t->bin.op){
+                case '+': sem_op = yap_bin_expr_add; break;
+                case '-': sem_op = yap_bin_expr_sub; break;
+                case '*': sem_op = yap_bin_expr_mul; break;
+                case '/': sem_op = yap_bin_expr_div; break;
+                case '%': sem_op = yap_bin_expr_mod; break;
+                case 'e': sem_op = yap_bin_expr_eq;  break;
+                case 'n': sem_op = yap_bin_expr_neq; break;
+                case '<': sem_op = yap_bin_expr_lt;  break;
+                case '>': sem_op = yap_bin_expr_gt;  break;
+                case 'l': sem_op = yap_bin_expr_le;  break;
+                case 'g': sem_op = yap_bin_expr_ge;  break;
+                default:
+                    *ok = false;
+                    yap_build_push_error(src, loc, "unsupported binary operator in blueprint");
+                    return *t;
+            }
+            yap_expr_node l = bp_desugar_template(src, t->bin.left, ok);
+            yap_expr_node r = bp_desugar_template(src, t->bin.right, ok);
+            // yapi->bin_op(left, op, right) — op is the middle (int) argument
+            yap_expr_node args[3] = { l, bp_int_node(src, (long)sem_op, loc), r };
+            return bp_yapi_call(src, "bin_op", args, 3, loc);
+        }
+        default:
+            *ok = false;
+            yap_build_push_error(src, loc, "unsupported expression inside blueprint (first cut supports literals, variables, holes and arithmetic)");
+            return *t;
+    }
+}
+
+static yap_expr yap_build_blueprint_expr(yap_source* src, yap_blueprint_node* bp){
+    yap_ctx* ctx = src->ctx;
+    if (!bp->template){
+        yap_build_push_error(src, bp->loc, "empty blueprint");
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+    bool ok = true;
+    yap_expr_node desugared = bp_desugar_template(src, bp->template, &ok);
+    if (!ok) return (yap_expr){ .kind = yap_expr_error };
+    yap_expr built = yap_build_expr(src, &desugared);
+    if (built.kind == yap_expr_error) return built;
+    built.type = ctx->yexprblueprint_type_id; // a template, not yet a usable yExpr
+    return built;
+}
+
+/* ----------------------------------------------------------------
  *  Expressions
  * ---------------------------------------------------------------- */
 
@@ -933,6 +1077,13 @@ yap_expr yap_build_expr(yap_source* src, yap_expr_node* node){
         case yap_expr_block:         ret = yap_build_block_expr(src, &node->block);                break;
         case yap_expr_module_access: ret = yap_build_module_access_expr(src, &node->module_access); break;
         case yap_expr_macro:         ret = yap_build_macro_expr(src, &node->macro_call); break;
+        case yap_expr_blueprint:     ret = yap_build_blueprint_expr(src, &node->blueprint); break;
+        case yap_expr_blueprint_hole:
+            yap_build_push_error(src, node->loc,
+                "blueprint hole '$%s' used outside a $(...) blueprint",
+                node->blueprint_hole.name.value ? node->blueprint_hole.name.value : "?");
+            ret = (yap_expr){ .kind = yap_expr_error };
+            break;
         case yap_expr_method_access:
             yap_build_push_error(src, node->loc, "Method access must be called, e.g. 'obj:%s(args)'", node->method_access.name.value);
             break;
@@ -1924,6 +2075,7 @@ static bool yap_is_comptime_type(yap_ctx* ctx, yap_type_id id){
         || id == ctx->ytype_type_id
         || id == ctx->ystatement_type_id
         || id == ctx->yfunc_type_id
+        || id == ctx->yexprblueprint_type_id
         || id == ctx->void_type_id;
 }
 
