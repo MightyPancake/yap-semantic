@@ -44,15 +44,8 @@ static void yap_build_push_error(yap_source* src, yap_loc loc, const char* fmt, 
 
 /*
  * Recursive post-order build: leaves first, deduplicated by origin.
- *
- * visited_origins is taken by pointer-to-darr: darr_push can reallocate the
- * backing buffer, and since the darr handle is a plain pointer passed
- * through many levels of recursion, a realloc inside a deep call must be
- * visible to every shallower/sibling frame still holding that handle.
- * Passing it by value here previously left ancestor frames with a stale
- * pointer the moment enough origins accumulated to trigger a grow, which
- * segfaulted (via a dangling-pointer strcmp) once import graphs got large
- * enough (e.g. importing io + math + arr together).
+ * visited_origins is a pointer-to-darr so a realloc in a deep call stays
+ * visible to shallower frames instead of leaving them a dangling pointer.
  */
 static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(char*)* visited_origins){
     if (!src || !src->source_node) return;
@@ -628,13 +621,7 @@ yap_statement yap_build_expr_statement(yap_source* src, yap_expr_node* expr_node
     return (yap_statement){ .kind = yap_statement_expr, .expr = e };
 }
 
-// Range-checks a literal (or a unary-minus-negated literal, to get INT_MIN-
-// style magnitudes right) against a concrete target type, at the two places
-// an untyped literal meets a known concrete type: var-decl initializers and
-// assignments. yap_ctx_type_id_assignable only checks type-kind
-// compatibility, never magnitude, so this is the one place a literal's
-// actual value gets validated against the width it's landing in (e.g.
-// 'i32 x = 0xFFFFFFFF;' is now rejected instead of silently truncating).
+// Validates a literal's value against its target type's width (yap_ctx_type_id_assignable only checks kind, not magnitude).
 static bool yap_check_literal_range(yap_source* src, yap_loc loc, yap_expr expr, yap_type_id target_type_id){
     yap_ctx* ctx = src->ctx;
 
@@ -1044,10 +1031,7 @@ yap_expr yap_build_literal_expr(yap_source* src, yap_literal_node* lit){
 
     switch (lit->kind){
         case yap_literal_numerical: {
-            // Detect float literals (contain a '.' or an exponent marker) vs
-            // integer literals -- hex/octal/binary integers were already
-            // normalized to plain decimal text by the parser, so a bare 'e'
-            // here can only be a decimal exponent, never a hex digit.
+            // hex/octal/binary are already normalized to decimal text, so a bare 'e' is always a decimal exponent
             bool is_float = strchr(lit->numerical, '.') != NULL
                 || strchr(lit->numerical, 'e') != NULL
                 || strchr(lit->numerical, 'E') != NULL;
@@ -2107,10 +2091,7 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
 
     if (provided_count != expected_count){
         yap_type* last_expected = (expected_count > 0) ? yap_ctx_get_type(ctx, expected_args[expected_count - 1]) : NULL;
-        // Structural check (element type, not type_id) so a trailing param
-        // spelled 'yExpr[]@' is recognized the same as 'yExprList@' -- both
-        // resolve to the identical anonymous slice-of-yExpr type underneath,
-        // and only the named 'yExprList' alias carries ctx->yexprlist_type_id.
+        // Structural check: 'yExpr[]@' and 'yExprList@' resolve to the same anonymous slice type
         yap_type* last_pointee = (last_expected && last_expected->kind == yap_type_ptr)
             ? yap_ctx_get_type(ctx, last_expected->pointer_type) : NULL;
         bool last_is_yexprlist_ptr = last_pointee && last_pointee->kind == yap_type_slice
