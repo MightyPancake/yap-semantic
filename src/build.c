@@ -953,16 +953,24 @@ static yap_expr_node bp_int_node(yap_source* src, long v, yap_loc loc){
 }
 
 static yap_expr_node bp_type_to_yexpr(yap_source* src, yap_type_node* t, bool* ok); // fwd (used by cast)
+static yap_expr_node bp_build_type_body_chain(yap_source* src, yap_type_node* body, bool* ok); // fwd (mutually recursive w/ bp_type_to_yexpr, for anon nested fields)
 
 // Rewrite a blueprint template expr into the yapi-> builder call that rebuilds
 // it. Supports literals, variable refs, holes, parens, unary minus, ternary,
 // binary arithmetic + comparisons, and (added for stmt${ }/fn$ bodies)
 // assignment, member/index, deref, address-of, cast, and calls (<=3 args).
-static yap_expr_node bp_desugar_template(yap_source* src, yap_expr_node* t, bool* ok){
+// `eager`: expr${ }/stmt${ } pass false ($name -> yapi->hole(...), a lazy hole
+// closed later via :fill_expr()); fn$ passes true for its body ($name -> a
+// bare var-ref to the in-scope comptime value, spliced immediately — fn$ has
+// no fill methods at all, so a hole here could never be closed).
+static yap_expr_node bp_desugar_template(yap_source* src, yap_expr_node* t, bool* ok, bool eager){
     yap_ctx* ctx = src->ctx;
     yap_loc loc = t->loc;
     switch (t->kind){
         case yap_expr_blueprint_hole: {
+            if (eager)
+                return (yap_expr_node){ .kind = yap_expr_var,
+                    .var = { .value = yap_ctx_strus_cpy(ctx, t->blueprint_hole.name.value), .loc = loc }, .loc = loc };
             yap_expr_node arg = bp_cstr_node(src, yap_ctx_strus_cpy(ctx, t->blueprint_hole.name.value), loc);
             return bp_yapi_call(src, "hole", &arg, 1, loc);
         }
@@ -971,16 +979,16 @@ static yap_expr_node bp_desugar_template(yap_source* src, yap_expr_node* t, bool
             return bp_yapi_call(src, "var_value", &arg, 1, loc);
         }
         case yap_expr_paren:
-            return bp_desugar_template(src, t->paren.expr, ok);
+            return bp_desugar_template(src, t->paren.expr, ok, eager);
         case yap_expr_unary: {
             // prefix '-' — the only unary the parser produces today
-            yap_expr_node inner = bp_desugar_template(src, t->unary.expr, ok);
+            yap_expr_node inner = bp_desugar_template(src, t->unary.expr, ok, eager);
             return bp_yapi_call(src, "neg", &inner, 1, loc);
         }
         case yap_expr_ternary: {
-            yap_expr_node c  = bp_desugar_template(src, t->ternary.condition, ok);
-            yap_expr_node th = bp_desugar_template(src, t->ternary.then_expr, ok);
-            yap_expr_node el = bp_desugar_template(src, t->ternary.else_expr, ok);
+            yap_expr_node c  = bp_desugar_template(src, t->ternary.condition, ok, eager);
+            yap_expr_node th = bp_desugar_template(src, t->ternary.then_expr, ok, eager);
+            yap_expr_node el = bp_desugar_template(src, t->ternary.else_expr, ok, eager);
             yap_expr_node args[3] = { c, th, el };
             return bp_yapi_call(src, "ternary", args, 3, loc);
         }
@@ -1024,8 +1032,8 @@ static yap_expr_node bp_desugar_template(yap_source* src, yap_expr_node* t, bool
                     yap_build_push_error(src, loc, "unsupported binary operator in blueprint");
                     return *t;
             }
-            yap_expr_node l = bp_desugar_template(src, t->bin.left, ok);
-            yap_expr_node r = bp_desugar_template(src, t->bin.right, ok);
+            yap_expr_node l = bp_desugar_template(src, t->bin.left, ok, eager);
+            yap_expr_node r = bp_desugar_template(src, t->bin.right, ok, eager);
             // yapi->bin_op(left, op, right) — op is the middle (int) argument
             yap_expr_node args[3] = { l, bp_int_node(src, (long)sem_op, loc), r };
             return bp_yapi_call(src, "bin_op", args, 3, loc);
@@ -1033,33 +1041,33 @@ static yap_expr_node bp_desugar_template(yap_source* src, yap_expr_node* t, bool
         case yap_expr_assignment: {
             // op is a string like "=", "+=", "*="; op[0] is what yapi->assign wants
             // ('=' means plain assign; '+' means +=, etc. — the builder appends '=').
-            yap_expr_node l = bp_desugar_template(src, t->assignment.left, ok);
-            yap_expr_node r = bp_desugar_template(src, t->assignment.right, ok);
+            yap_expr_node l = bp_desugar_template(src, t->assignment.left, ok, eager);
+            yap_expr_node r = bp_desugar_template(src, t->assignment.right, ok, eager);
             yap_expr_node args[3] = { l, bp_int_node(src, (long)t->assignment.op[0], loc), r };
             return bp_yapi_call(src, "assign", args, 3, loc);
         }
         case yap_expr_member_access: {
-            yap_expr_node obj = bp_desugar_template(src, t->member_access.object, ok);
+            yap_expr_node obj = bp_desugar_template(src, t->member_access.object, ok, eager);
             yap_expr_node fld = bp_cstr_node(src, yap_ctx_strus_cpy(ctx, t->member_access.member.value), loc);
             yap_expr_node args[2] = { obj, fld };
             return bp_yapi_call(src, "member", args, 2, loc);
         }
         case yap_expr_index_access: {
-            yap_expr_node obj = bp_desugar_template(src, t->index_access.object, ok);
-            yap_expr_node idx = bp_desugar_template(src, t->index_access.index, ok);
+            yap_expr_node obj = bp_desugar_template(src, t->index_access.object, ok, eager);
+            yap_expr_node idx = bp_desugar_template(src, t->index_access.index, ok, eager);
             yap_expr_node args[2] = { obj, idx };
             return bp_yapi_call(src, "index", args, 2, loc);
         }
         case yap_expr_deref: {
-            yap_expr_node inner = bp_desugar_template(src, t->deref.expr, ok);
+            yap_expr_node inner = bp_desugar_template(src, t->deref.expr, ok, eager);
             return bp_yapi_call(src, "deref", &inner, 1, loc);
         }
         case yap_expr_at_op: {
-            yap_expr_node inner = bp_desugar_template(src, t->at_op.expr, ok);
+            yap_expr_node inner = bp_desugar_template(src, t->at_op.expr, ok, eager);
             return bp_yapi_call(src, "addr_of", &inner, 1, loc);
         }
         case yap_expr_cast: {
-            yap_expr_node inner = bp_desugar_template(src, t->cast.expr, ok);
+            yap_expr_node inner = bp_desugar_template(src, t->cast.expr, ok, eager);
             yap_expr_node ty    = bp_type_to_yexpr(src, t->cast.type_node, ok);
             yap_expr_node args[2] = { inner, ty };
             return bp_yapi_call(src, "cast", args, 2, loc);
@@ -1072,9 +1080,9 @@ static yap_expr_node bp_desugar_template(yap_source* src, yap_expr_node* t, bool
                 return *t;
             }
             yap_expr_node cargs[4];
-            cargs[0] = bp_desugar_template(src, t->func_call.func, ok);
+            cargs[0] = bp_desugar_template(src, t->func_call.func, ok, eager);
             int ci = 0;
-            for_darr(idx, a, t->func_call.args){ cargs[1 + ci] = bp_desugar_template(src, &a, ok); ci++; }
+            for_darr(idx, a, t->func_call.args){ cargs[1 + ci] = bp_desugar_template(src, &a, ok, eager); ci++; }
             const char* callname = argc == 0 ? "call0" : argc == 1 ? "call1" : argc == 2 ? "call2" : "call3";
             return bp_yapi_call(src, callname, cargs, argc + 1, loc);
         }
@@ -1092,7 +1100,7 @@ static yap_expr yap_build_blueprint_expr(yap_source* src, yap_blueprint_node* bp
         return (yap_expr){ .kind = yap_expr_error };
     }
     bool ok = true;
-    yap_expr_node desugared = bp_desugar_template(src, bp->template, &ok);
+    yap_expr_node desugared = bp_desugar_template(src, bp->template, &ok, false);
     if (!ok) return (yap_expr){ .kind = yap_expr_error };
     yap_expr built = yap_build_expr(src, &desugared);
     if (built.kind == yap_expr_error) return built;
@@ -1124,44 +1132,20 @@ static yap_expr_node bp_method_call(yap_source* src, yap_expr_node base, const c
         .loc = loc };
 }
 
-// Recursively desugar a field/variant type node into the yExpr that yields its
-// yType at comptime. $T (hole) -> eager splice of the in-scope comptime yType;
-// a named type -> yapi->type(c"name"). Pointer/slice/anon-type fields are an
-// extension point (recurse here later for embedded/anon types) — for now a clear error.
-static yap_expr_node bp_type_to_yexpr(yap_source* src, yap_type_node* t, bool* ok){
+// Chained yapi->struct_t()/union_t()/enum_t() + add_field/add_variant call for
+// an anonymous struct/union/enum body (no trailing :finish() -- the top-level
+// type${ } caller appends its own; nested anon field types (bp_type_to_yexpr)
+// append a compiler-generated :finish() name instead, same as normal
+// (non-blueprint) anonymous nested types do via ctx->anon_id).
+static yap_expr_node bp_build_type_body_chain(yap_source* src, yap_type_node* body, bool* ok){
     yap_ctx* ctx = src->ctx;
-    yap_loc loc = t ? t->loc : (yap_loc){0};
-    if (!t){ *ok = false; return (yap_expr_node){ .kind = yap_expr_error, .loc = loc }; }
-    switch (t->kind){
-        case yap_type_node_blueprint_hole:
-            return (yap_expr_node){ .kind = yap_expr_var,
-                .var = { .value = yap_ctx_strus_cpy(ctx, t->identifier.value), .loc = loc }, .loc = loc };
-        case yap_type_node_identifier: {
-            yap_expr_node arg = bp_cstr_node(src, yap_ctx_strus_cpy(ctx, t->identifier.value), loc);
-            return bp_yapi_call(src, "type", &arg, 1, loc);
-        }
-        default:
-            *ok = false;
-            yap_build_push_error(src, loc, "unsupported field type in type blueprint (first cut: identifier types and $holes; pointer/slice/anon types are an extension point)");
-            return (yap_expr_node){ .kind = yap_expr_error, .loc = loc };
-    }
-}
-
-static yap_expr yap_build_type_blueprint(yap_source* src, yap_type_blueprint_node* tb){
-    yap_ctx* ctx = src->ctx;
-    yap_loc loc = tb->loc;
-    yap_type_node* body = tb->body;
-    if (!body){
-        yap_build_push_error(src, loc, "empty type blueprint");
-        return (yap_expr){ .kind = yap_expr_error };
-    }
-    bool ok = true;
+    yap_loc loc = body->loc;
     yap_expr_node chain;
     switch (body->kind){
         case yap_type_node_anon_struct:
             chain = bp_yapi_call(src, "struct_t", NULL, 0, loc);
             for_darr(i, f, body->anon_struct.fields){
-                yap_expr_node args[2] = { bp_type_to_yexpr(src, f.type_node, &ok),
+                yap_expr_node args[2] = { bp_type_to_yexpr(src, f.type_node, ok),
                                           bp_cstr_node(src, yap_ctx_strus_cpy(ctx, f.name.value), loc) };
                 chain = bp_method_call(src, chain, "add_field", args, 2, loc);
             }
@@ -1169,7 +1153,7 @@ static yap_expr yap_build_type_blueprint(yap_source* src, yap_type_blueprint_nod
         case yap_type_node_anon_union:
             chain = bp_yapi_call(src, "union_t", NULL, 0, loc);
             for_darr(i, f, body->anon_union.variants){
-                yap_expr_node args[2] = { bp_type_to_yexpr(src, f.type_node, &ok),
+                yap_expr_node args[2] = { bp_type_to_yexpr(src, f.type_node, ok),
                                           bp_cstr_node(src, yap_ctx_strus_cpy(ctx, f.name.value), loc) };
                 chain = bp_method_call(src, chain, "add_field", args, 2, loc);
             }
@@ -1182,9 +1166,73 @@ static yap_expr yap_build_type_blueprint(yap_source* src, yap_type_blueprint_nod
             }
             break;
         default:
+            *ok = false;
             yap_build_push_error(src, loc, "type blueprint body must be an anonymous struct/enum/union");
-            return (yap_expr){ .kind = yap_expr_error };
+            return (yap_expr_node){ .kind = yap_expr_error, .loc = loc };
     }
+    return chain;
+}
+
+// Recursively desugar a field/variant type node into the yExpr that yields its
+// yType at comptime. $T (hole) -> eager splice of the in-scope comptime yType;
+// a named type -> yapi->type(c"name"); pointer/slice -> yapi->ptr_of/slice_of
+// wrapping the recursively-resolved element type; an anon nested struct/union/
+// enum -> the same struct_t/union_t/enum_t chain as a top-level type${ } body,
+// closed with a compiler-generated :finish() name. Deliberately NOT
+// yap_ctx_get_anon_name's "__anon_*" convention: that name is a marker normal
+// (non-blueprint) anonymous nested types rely on to mean "embed inline at the
+// use site, never emit a standalone declaration" (yap_gen_type_decl skips any
+// type whose name starts with "__" as C-reserved) -- Model A's blueprint types
+// are always independently finish()ed/nameable/dedup'd, the opposite of that,
+// so a "__"-prefixed name here would silently vanish from codegen while still
+// being referenced by field type, producing an undeclared-type compile error.
+// Const/array/function/macro field types remain an extension point (clear error).
+static yap_expr_node bp_type_to_yexpr(yap_source* src, yap_type_node* t, bool* ok){
+    yap_ctx* ctx = src->ctx;
+    yap_loc loc = t ? t->loc : (yap_loc){0};
+    if (!t){ *ok = false; return (yap_expr_node){ .kind = yap_expr_error, .loc = loc }; }
+    switch (t->kind){
+        case yap_type_node_blueprint_hole:
+            return (yap_expr_node){ .kind = yap_expr_var,
+                .var = { .value = yap_ctx_strus_cpy(ctx, t->identifier.value), .loc = loc }, .loc = loc };
+        case yap_type_node_identifier: {
+            yap_expr_node arg = bp_cstr_node(src, yap_ctx_strus_cpy(ctx, t->identifier.value), loc);
+            return bp_yapi_call(src, "type", &arg, 1, loc);
+        }
+        case yap_type_node_pointer: {
+            yap_expr_node inner = bp_type_to_yexpr(src, t->pointer_subtype, ok);
+            return bp_yapi_call(src, "ptr_of", &inner, 1, loc);
+        }
+        case yap_type_node_slice: {
+            yap_expr_node inner = bp_type_to_yexpr(src, t->slice_subtype, ok);
+            return bp_yapi_call(src, "slice_of", &inner, 1, loc);
+        }
+        case yap_type_node_anon_struct:
+        case yap_type_node_anon_union:
+        case yap_type_node_anon_enum: {
+            yap_expr_node chain = bp_build_type_body_chain(src, t, ok);
+            const char* kind_str = t->kind == yap_type_node_anon_struct ? "struct"
+                                  : t->kind == yap_type_node_anon_union ? "union" : "enum";
+            char* name = yap_ctx_strus_newf(ctx, "bp_anon_%s_%lu", kind_str, (unsigned long)ctx->anon_id++);
+            yap_expr_node nm = bp_cstr_node(src, name, loc);
+            return bp_method_call(src, chain, "finish", &nm, 1, loc);
+        }
+        default:
+            *ok = false;
+            yap_build_push_error(src, loc, "unsupported field type in type blueprint (first cut: identifiers, $holes, pointers, slices, anon struct/union/enum; const/array/function types are an extension point)");
+            return (yap_expr_node){ .kind = yap_expr_error, .loc = loc };
+    }
+}
+
+static yap_expr yap_build_type_blueprint(yap_source* src, yap_type_blueprint_node* tb){
+    yap_loc loc = tb->loc;
+    yap_type_node* body = tb->body;
+    if (!body){
+        yap_build_push_error(src, loc, "empty type blueprint");
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+    bool ok = true;
+    yap_expr_node chain = bp_build_type_body_chain(src, body, &ok);
     if (!ok) return (yap_expr){ .kind = yap_expr_error };
     return yap_build_expr(src, &chain); // chain types as yStructT/yEnumT/yUnionT via chainable builders
 }
@@ -1197,36 +1245,42 @@ static yap_expr yap_build_type_blueprint(yap_source* src, yap_type_blueprint_nod
  *  A sequence >1 is wrapped in yapi->block(stmt_list). The result is stamped
  *  yStmtBlueprint; :fill_expr(...)/:finish() (build_state.c) clone + close it.
  * ---------------------------------------------------------------- */
-static yap_expr_node bp_desugar_stmt(yap_source* src, yap_statement_node* s, bool* ok); // fwd
+static yap_expr_node bp_desugar_stmt(yap_source* src, yap_statement_node* s, bool* ok, bool eager); // fwd
 
-static yap_expr_node bp_desugar_stmt_seq(yap_source* src, darr(yap_statement_node) body, yap_loc loc, bool* ok){
+static yap_expr_node bp_desugar_stmt_seq(yap_source* src, darr(yap_statement_node) body, yap_loc loc, bool* ok, bool eager){
     unsigned int n = darr_len(body);
     if (n == 0){
         *ok = false;
         yap_build_push_error(src, loc, "empty statement sequence in blueprint");
         return (yap_expr_node){ .kind = yap_expr_error, .loc = loc };
     }
-    if (n == 1) return bp_desugar_stmt(src, &body[0], ok);
+    if (n == 1) return bp_desugar_stmt(src, &body[0], ok, eager);
     yap_expr_node list = bp_yapi_call(src, "stmt_list_new", NULL, 0, loc); // empty; push below
     for_darr(idx, st, body){
-        yap_expr_node ds = bp_desugar_stmt(src, &st, ok);
+        yap_expr_node ds = bp_desugar_stmt(src, &st, ok, eager);
         yap_expr_node args[2] = { list, ds };
         list = bp_yapi_call(src, "stmt_list_push", args, 2, loc);
     }
     return bp_yapi_call(src, "block", &list, 1, loc);
 }
 
-static yap_expr_node bp_desugar_stmt(yap_source* src, yap_statement_node* s, bool* ok){
+// `eager`: see bp_desugar_template. A bare `$body;` statement in lazy mode is a
+// statement hole (fill_stmt); in eager mode (fn$ bodies) it's a direct splice
+// of the in-scope comptime yStmt value -- a bare var-ref used AS the "build a
+// yStmt" expression, since that value already IS one (no hole, no fill needed).
+static yap_expr_node bp_desugar_stmt(yap_source* src, yap_statement_node* s, bool* ok, bool eager){
     yap_loc loc = s->loc;
     switch (s->kind){
         case yap_statement_expr: {
-            // A bare `$body;` in statement position is a statement hole (fill_stmt),
-            // not an expression statement wrapping an expr hole.
             if (s->expr.kind == yap_expr_blueprint_hole){
-                yap_expr_node nm = bp_cstr_node(src, yap_ctx_strus_cpy(src->ctx, s->expr.blueprint_hole.name.value), loc);
+                char* name = s->expr.blueprint_hole.name.value;
+                if (eager)
+                    return (yap_expr_node){ .kind = yap_expr_var,
+                        .var = { .value = yap_ctx_strus_cpy(src->ctx, name), .loc = loc }, .loc = loc };
+                yap_expr_node nm = bp_cstr_node(src, yap_ctx_strus_cpy(src->ctx, name), loc);
                 return bp_yapi_call(src, "hole_stmt", &nm, 1, loc);
             }
-            yap_expr_node e = bp_desugar_template(src, &s->expr, ok);
+            yap_expr_node e = bp_desugar_template(src, &s->expr, ok, eager);
             return bp_yapi_call(src, "expr_stmt", &e, 1, loc);
         }
         case yap_statement_return: {
@@ -1235,23 +1289,23 @@ static yap_expr_node bp_desugar_stmt(yap_source* src, yap_statement_node* s, boo
                 yap_build_push_error(src, loc, "bare 'ret;' not supported in stmt blueprint (needs a value)");
                 return (yap_expr_node){ .kind = yap_expr_error, .loc = loc };
             }
-            yap_expr_node e = bp_desugar_template(src, &s->return_stmt.value, ok);
+            yap_expr_node e = bp_desugar_template(src, &s->return_stmt.value, ok, eager);
             return bp_yapi_call(src, "return_stmt", &e, 1, loc);
         }
         case yap_statement_if: {
-            yap_expr_node cond = bp_desugar_template(src, &s->if_stmt.condition, ok);
-            yap_expr_node then = bp_desugar_stmt(src, s->if_stmt.then_branch, ok);
+            yap_expr_node cond = bp_desugar_template(src, &s->if_stmt.condition, ok, eager);
+            yap_expr_node then = bp_desugar_stmt(src, s->if_stmt.then_branch, ok, eager);
             yap_expr_node args[2] = { cond, then };
             return bp_yapi_call(src, "if_stmt", args, 2, loc);
         }
         case yap_statement_while: {
-            yap_expr_node cond = bp_desugar_template(src, &s->while_stmt.condition, ok);
-            yap_expr_node body = bp_desugar_stmt(src, s->while_stmt.body, ok);
+            yap_expr_node cond = bp_desugar_template(src, &s->while_stmt.condition, ok, eager);
+            yap_expr_node body = bp_desugar_stmt(src, s->while_stmt.body, ok, eager);
             yap_expr_node args[2] = { cond, body };
             return bp_yapi_call(src, "while_stmt", args, 2, loc);
         }
         case yap_statement_block:
-            return bp_desugar_stmt_seq(src, s->block.statements, loc, ok);
+            return bp_desugar_stmt_seq(src, s->block.statements, loc, ok, eager);
         default:
             *ok = false;
             yap_build_push_error(src, loc, "unsupported statement in stmt blueprint (first cut: expression statements, 'ret expr;', if, while, blocks)");
@@ -1262,7 +1316,7 @@ static yap_expr_node bp_desugar_stmt(yap_source* src, yap_statement_node* s, boo
 static yap_expr yap_build_stmt_blueprint(yap_source* src, yap_stmt_blueprint_node* sb){
     yap_ctx* ctx = src->ctx;
     bool ok = true;
-    yap_expr_node result = bp_desugar_stmt_seq(src, sb->body, sb->loc, &ok);
+    yap_expr_node result = bp_desugar_stmt_seq(src, sb->body, sb->loc, &ok, false);
     if (!ok) return (yap_expr){ .kind = yap_expr_error };
     yap_expr built = yap_build_expr(src, &result);
     if (built.kind == yap_expr_error) return built;
@@ -1282,11 +1336,13 @@ static yap_expr yap_build_stmt_blueprint(yap_source* src, yap_stmt_blueprint_nod
  *  eagerly splices the in-scope comptime yType (via bp_type_to_yexpr).
  * ---------------------------------------------------------------- */
 
-// Always wrap a statement sequence in yapi->block(stmt_list) — a fn body is a block.
+// Always wrap a statement sequence in yapi->block(stmt_list) — a fn body is a
+// block. Always eager (true): fn$ bodies have no fill methods, so any $hole
+// here must splice immediately, not defer to a fill that could never come.
 static yap_expr_node bp_desugar_block(yap_source* src, darr(yap_statement_node) body, yap_loc loc, bool* ok){
     yap_expr_node list = bp_yapi_call(src, "stmt_list_new", NULL, 0, loc);
     for_darr(idx, st, body){
-        yap_expr_node ds = bp_desugar_stmt(src, &st, ok);
+        yap_expr_node ds = bp_desugar_stmt(src, &st, ok, true);
         yap_expr_node args[2] = { list, ds };
         list = bp_yapi_call(src, "stmt_list_push", args, 2, loc);
     }
