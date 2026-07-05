@@ -1022,8 +1022,9 @@ static yap_expr_node bp_yapi_call(yap_source* src, const char* name,
         .module_access = { .module = { .value = (char*)"yapi", .loc = loc },
                            .field  = { .value = (char*)name,   .loc = loc },
                            .loc = loc }, .loc = loc };
-    darr(yap_expr_node) argd = yap_ctx_darr_new(ctx, yap_expr_node, .cap = argc, .len = 0);
-    for (int i = 0; i < argc; i++) darr_push(argd, args[i]);
+    darr(yap_call_arg_node) argd = yap_ctx_darr_new(ctx, yap_call_arg_node, .cap = argc, .len = 0);
+    for (int i = 0; i < argc; i++)
+        darr_push(argd, ((yap_call_arg_node){ .is_named = false, .value = yap_ctx_one_cpy(ctx, args[i]), .loc = loc }));
     return (yap_expr_node){ .kind = yap_expr_func_call,
         .func_call = { .func = yap_ctx_one_cpy(ctx, callee), .args = argd, .loc = loc },
         .loc = loc };
@@ -1187,10 +1188,17 @@ static yap_expr_node bp_desugar_template(yap_source* src, yap_expr_node* t, bool
                 yap_build_push_error(src, loc, "call in blueprint supports up to 3 args (yapi->call0..3)");
                 return *t;
             }
+            for_darr(idx, a, t->func_call.args){
+                if (a.is_named){
+                    *ok = false;
+                    yap_build_push_error(src, loc, "named arguments are not supported inside an expression blueprint");
+                    return *t;
+                }
+            }
             yap_expr_node cargs[4];
             cargs[0] = bp_desugar_template(src, t->func_call.func, ok, eager);
             int ci = 0;
-            for_darr(idx, a, t->func_call.args){ cargs[1 + ci] = bp_desugar_template(src, &a, ok, eager); ci++; }
+            for_darr(idx, a, t->func_call.args){ cargs[1 + ci] = bp_desugar_template(src, a.value, ok, eager); ci++; }
             const char* callname = argc == 0 ? "call0" : argc == 1 ? "call1" : argc == 2 ? "call2" : "call3";
             return bp_yapi_call(src, callname, cargs, argc + 1, loc);
         }
@@ -1233,8 +1241,9 @@ static yap_expr_node bp_method_call(yap_source* src, yap_expr_node base, const c
     yap_expr_node callee = { .kind = yap_expr_method_access,
         .method_access = { .caller = yap_ctx_one_cpy(ctx, base),
                            .name = { .value = (char*)method, .loc = loc }, .loc = loc }, .loc = loc };
-    darr(yap_expr_node) argd = yap_ctx_darr_new(ctx, yap_expr_node, .cap = argc, .len = 0);
-    for (int i = 0; i < argc; i++) darr_push(argd, args[i]);
+    darr(yap_call_arg_node) argd = yap_ctx_darr_new(ctx, yap_call_arg_node, .cap = argc, .len = 0);
+    for (int i = 0; i < argc; i++)
+        darr_push(argd, ((yap_call_arg_node){ .is_named = false, .value = yap_ctx_one_cpy(ctx, args[i]), .loc = loc }));
     return (yap_expr_node){ .kind = yap_expr_func_call,
         .func_call = { .func = yap_ctx_one_cpy(ctx, callee), .args = argd, .loc = loc },
         .loc = loc };
@@ -2034,6 +2043,34 @@ static yap_expr yap_build_method_callee(yap_source* src, yap_method_access_node*
     };
 }
 
+/* Looks up the top-level declaration a call targets (a plain function name,
+ * or the mangled "TypeName_method" name a method call resolves to), so
+ * default values and parameter names can be read off it. Returns NULL for
+ * anything called indirectly through a function-typed variable/expression,
+ * since there's no declaration to resolve names/defaults against there. */
+static yap_func_decl* yap_find_func_decl_for_call(yap_source* src, yap_expr func_expr){
+    yap_ctx* ctx = src->ctx;
+    if (func_expr.kind != yap_expr_var || !func_expr.var_name) return NULL;
+    for (darr_size_t di = 0; di < darr_len(ctx->semantic_decls); di++){
+        yap_decl* d = &ctx->semantic_decls[di];
+        if ((d->kind == yap_decl_func_def || d->kind == yap_decl_func_decl) && d->func_decl.name){
+            bool match;
+            if (d->module_prefix && d->module_prefix[0]) {
+                size_t plen = strlen(d->module_prefix);
+                size_t nlen = strlen(d->func_decl.name);
+                size_t vlen = strlen(func_expr.var_name);
+                match = (vlen == plen + nlen)
+                     && memcmp(func_expr.var_name, d->module_prefix, plen) == 0
+                     && memcmp(func_expr.var_name + plen, d->func_decl.name, nlen) == 0;
+            } else {
+                match = strcmp(d->func_decl.name, func_expr.var_name) == 0;
+            }
+            if (match) return &d->func_decl;
+        }
+    }
+    return NULL;
+}
+
 yap_expr yap_build_func_call_expr(yap_source* src, yap_func_call_node* call){
     yap_ctx* ctx = src->ctx;
 
@@ -2052,14 +2089,19 @@ yap_expr yap_build_func_call_expr(yap_source* src, yap_func_call_node* call){
     }
 
     darr(yap_type_id) expected_args = func_type->func.args;
-    unsigned int params_cap = darr_len(call->args) + (is_method_call ? 1 : 0);
-    if (darr_len(expected_args) > params_cap)
-        params_cap = darr_len(expected_args);
-    darr(yap_expr)    params = yap_ctx_darr_new(ctx, yap_expr,
-        .cap = params_cap, .len = 0);
+    unsigned int nexpected = darr_len(expected_args);
 
-    if (is_method_call){
-        if (darr_len(expected_args) > 0 && !yap_ctx_type_id_compatible(ctx, receiver.type, expected_args[0])){
+    /* Each declared parameter fills exactly one slot: positional args claim
+     * the next unclaimed slot in order, named args ('.name = value') claim
+     * their slot by name wherever it falls, and either kind can leave gaps
+     * for later args (positional or default) to fill -- same scheme
+     * yap_build_blob_cast already uses for struct-literal fields. */
+    bool*     used  = yap_ctx_malloc(ctx, sizeof(bool) * (nexpected ? nexpected : 1));
+    yap_expr* slots = yap_ctx_malloc(ctx, sizeof(yap_expr) * (nexpected ? nexpected : 1));
+    for (unsigned int i = 0; i < nexpected; i++) used[i] = false;
+
+    if (is_method_call && nexpected > 0){
+        if (!yap_ctx_type_id_compatible(ctx, receiver.type, expected_args[0])){
             /* Pointer-receiver method (subject type is 'T@'): auto-take-address of an
              * lvalue receiver of type 'T', same as Go/C++ implicit &this binding, so
              * mutating methods (e.g. a growable array's push()) can write back to the
@@ -2088,89 +2130,111 @@ yap_expr yap_build_func_call_expr(yap_source* src, yap_func_call_node* call){
                 return (yap_expr){ .kind = yap_expr_error };
             }
         }
-        darr_push(params, receiver);
+        slots[0] = receiver;
+        used[0]  = true;
     }
 
+    yap_func_decl* found_decl = NULL;
+    bool found_decl_resolved = false;
+    unsigned int pos_idx = 0;
+    unsigned int total_args = darr_len(call->args) + (is_method_call ? 1 : 0);
+
     for_darr(pi, arg_node, call->args){
-        yap_expr pe = yap_build_expr(src, &arg_node);
+        yap_expr pe = yap_build_expr(src, arg_node.value);
         if (pe.kind == yap_expr_error)
             return (yap_expr){ .kind = yap_expr_error };
 
-        if (darr_len(params) < darr_len(expected_args)){
-            yap_type_id expected = expected_args[darr_len(params)];
-            yap_type* pe_type = yap_ctx_get_type(ctx, pe.type);
-            if (pe_type && pe_type->kind == yap_type_blob){
-                pe = yap_build_blob_cast(src, pe, expected, call->loc);
-                if (pe.kind == yap_expr_error)
-                    return (yap_expr){ .kind = yap_expr_error };
-            } else if (!yap_ctx_type_id_compatible(ctx, pe.type, expected)){
-                char* expected_str = yap_ctx_type_id_to_string(ctx, expected);
-                char* actual_str   = yap_ctx_type_id_to_string(ctx, pe.type);
+        unsigned int target_idx;
+        if (arg_node.is_named){
+            if (!found_decl_resolved){
+                found_decl = yap_find_func_decl_for_call(src, func_expr);
+                found_decl_resolved = true;
+            }
+            if (!found_decl){
                 yap_build_push_error(src, call->loc,
-                    "Argument type mismatch: expected '%s', got '%s'",
-                    expected_str, actual_str);
-                free(expected_str);
-                free(actual_str);
+                    "Named argument '.%s' requires calling a directly-declared function",
+                    arg_node.name.value);
                 return (yap_expr){ .kind = yap_expr_error };
             }
-        }
-        darr_push(params, pe);
-    }
-
-    if (darr_len(params) < darr_len(expected_args)){
-        yap_func_decl* found_decl = NULL;
-        if (func_expr.kind == yap_expr_var && func_expr.var_name) {
-            for (darr_size_t di = 0; di < darr_len(ctx->semantic_decls); di++){
-                yap_decl* d = &ctx->semantic_decls[di];
-                if ((d->kind == yap_decl_func_def || d->kind == yap_decl_func_decl)
-                    && d->func_decl.name) {
-                    bool match;
-                    if (d->module_prefix && d->module_prefix[0]) {
-                        size_t plen = strlen(d->module_prefix);
-                        size_t nlen = strlen(d->func_decl.name);
-                        size_t vlen = strlen(func_expr.var_name);
-                        match = (vlen == plen + nlen)
-                             && memcmp(func_expr.var_name, d->module_prefix, plen) == 0
-                             && memcmp(func_expr.var_name + plen, d->func_decl.name, nlen) == 0;
-                    } else {
-                        match = strcmp(d->func_decl.name, func_expr.var_name) == 0;
+            bool found = false;
+            for (unsigned int i = 0; i < darr_len(found_decl->args) && i < nexpected; i++){
+                if (found_decl->args[i].kind == yap_func_arg_valid && found_decl->args[i].name
+                    && strus_eq(found_decl->args[i].name, arg_node.name.value)){
+                    if (used[i]){
+                        yap_build_push_error(src, call->loc,
+                            "Duplicate argument '.%s'", arg_node.name.value);
+                        return (yap_expr){ .kind = yap_expr_error };
                     }
-                    if (match) {
-                        found_decl = &d->func_decl;
-                        break;
-                    }
+                    target_idx = i;
+                    found = true;
+                    break;
                 }
             }
-        }
-
-        if (found_decl && found_decl->args) {
-            unsigned int provided = darr_len(params);
-            unsigned int expected = darr_len(expected_args);
-            for (unsigned int i = provided; i < expected; i++){
-                if (i < darr_len(found_decl->args)
-                    && found_decl->args[i].kind == yap_func_arg_valid
-                    && found_decl->args[i].default_value.kind != yap_expr_error) {
-                    darr_push(params, found_decl->args[i].default_value);
-                } else {
-                    yap_build_push_error(src, call->loc,
-                        "Missing argument %u with no default value", i + 1);
-                    return (yap_expr){ .kind = yap_expr_error };
-                }
+            if (!found){
+                yap_build_push_error(src, call->loc,
+                    "Function has no parameter named '%s'", arg_node.name.value);
+                return (yap_expr){ .kind = yap_expr_error };
             }
         } else {
+            while (pos_idx < nexpected && used[pos_idx]) pos_idx++;
+            if (pos_idx >= nexpected){
+                yap_build_push_error(src, call->loc,
+                    "Too many arguments: expected %u, got %u", nexpected, total_args);
+                return (yap_expr){ .kind = yap_expr_error };
+            }
+            target_idx = pos_idx;
+            pos_idx++;
+        }
+
+        yap_type_id expected = expected_args[target_idx];
+        yap_type* pe_type = yap_ctx_get_type(ctx, pe.type);
+        if (pe_type && pe_type->kind == yap_type_blob){
+            pe = yap_build_blob_cast(src, pe, expected, call->loc);
+            if (pe.kind == yap_expr_error)
+                return (yap_expr){ .kind = yap_expr_error };
+        } else if (!yap_ctx_type_id_compatible(ctx, pe.type, expected)){
+            char* expected_str = yap_ctx_type_id_to_string(ctx, expected);
+            char* actual_str   = yap_ctx_type_id_to_string(ctx, pe.type);
             yap_build_push_error(src, call->loc,
-                "Too few arguments: expected %u, got %u",
-                (unsigned)darr_len(expected_args), (unsigned)darr_len(params));
+                "Argument type mismatch: expected '%s', got '%s'",
+                expected_str, actual_str);
+            free(expected_str);
+            free(actual_str);
+            return (yap_expr){ .kind = yap_expr_error };
+        }
+
+        slots[target_idx] = pe;
+        used[target_idx]  = true;
+    }
+
+    unsigned int filled = 0;
+    for (unsigned int i = 0; i < nexpected; i++) if (used[i]) filled++;
+
+    for (unsigned int i = 0; i < nexpected; i++){
+        if (used[i]) continue;
+        if (!found_decl_resolved){
+            found_decl = yap_find_func_decl_for_call(src, func_expr);
+            found_decl_resolved = true;
+        }
+        if (!found_decl){
+            yap_build_push_error(src, call->loc,
+                "Too few arguments: expected %u, got %u", nexpected, filled);
+            return (yap_expr){ .kind = yap_expr_error };
+        }
+        if (i < darr_len(found_decl->args)
+            && found_decl->args[i].kind == yap_func_arg_valid
+            && found_decl->args[i].default_value.kind != yap_expr_error) {
+            slots[i] = found_decl->args[i].default_value;
+            used[i]  = true;
+        } else {
+            yap_build_push_error(src, call->loc,
+                "Missing argument %u with no default value", i + 1);
             return (yap_expr){ .kind = yap_expr_error };
         }
     }
 
-    if (darr_len(params) > darr_len(expected_args)){
-        yap_build_push_error(src, call->loc,
-            "Too many arguments: expected %u, got %u",
-            (unsigned)darr_len(expected_args), (unsigned)darr_len(params));
-        return (yap_expr){ .kind = yap_expr_error };
-    }
+    darr(yap_expr) params = yap_ctx_darr_new(ctx, yap_expr, .cap = nexpected, .len = 0);
+    for (unsigned int i = 0; i < nexpected; i++) darr_push(params, slots[i]);
 
     return (yap_expr){
         .kind      = yap_expr_func_call,
