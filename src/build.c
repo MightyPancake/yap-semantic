@@ -999,19 +999,19 @@ yap_statement yap_build_block_statement(yap_source* src, yap_block_node* bnode){
 }
 
 /* ----------------------------------------------------------------
- *  Blueprints — the $(...) quasi-quote literal
+ *  Blueprints ; the $(...) quasi-quote literal
  *
  *  A blueprint is pure sugar over the yapi-> builder API: $(...) is rewritten
  *  into ordinary yapi->hole/int/bin_op/... calls (parse nodes) that are built
  *  normally, so they codegen into the enclosing macro's body and run under TCC
  *  like any hand-written builder call. The result is stamped yExprBlueprint
- *  (which shares a C representation with yExpr — both are yap_expr*), so the
+ *  (which shares a C representation with yExpr ; both are yap_expr*), so the
  *  only front-end bridging is this one type override.
  *
  *  Filling and finishing are NOT handled here: they are ordinary methods on
  *  yExprBlueprint (yExprBlueprint_fill / yExprBlueprint_finish, registered in
  *  ctx.c, implemented in build_state.c) dispatched through the normal
- *  obj:method(args) path — e.g. $($x+1):fill(c"x", a):finish().
+ *  obj:method(args) path ; e.g. $($x+1):fill(c"x", a):finish().
  * ---------------------------------------------------------------- */
 
 // yapi->NAME(args...) as a parse node.
@@ -1057,7 +1057,7 @@ static yap_expr_node bp_build_type_body_chain(yap_source* src, yap_type_node* bo
 // assignment, member/index, deref, address-of, cast, and calls (<=3 args).
 // `eager`: expr${ }/stmt${ } pass false ($name -> yapi->hole(...), a lazy hole
 // closed later via :fill_expr()); fn$ passes true for its body ($name -> a
-// bare var-ref to the in-scope comptime value, spliced immediately — fn$ has
+// bare var-ref to the in-scope comptime value, spliced immediately ; fn$ has
 // no fill methods at all, so a hole here could never be closed).
 static yap_expr_node bp_desugar_template(yap_source* src, yap_expr_node* t, bool* ok, bool eager){
     yap_ctx* ctx = src->ctx;
@@ -1077,7 +1077,7 @@ static yap_expr_node bp_desugar_template(yap_source* src, yap_expr_node* t, bool
         case yap_expr_paren:
             return bp_desugar_template(src, t->paren.expr, ok, eager);
         case yap_expr_unary: {
-            // prefix '-' — the only unary the parser produces today
+            // prefix '-' ; the only unary the parser produces today
             yap_expr_node inner = bp_desugar_template(src, t->unary.expr, ok, eager);
             return bp_yapi_call(src, "neg", &inner, 1, loc);
         }
@@ -1130,13 +1130,13 @@ static yap_expr_node bp_desugar_template(yap_source* src, yap_expr_node* t, bool
             }
             yap_expr_node l = bp_desugar_template(src, t->bin.left, ok, eager);
             yap_expr_node r = bp_desugar_template(src, t->bin.right, ok, eager);
-            // yapi->bin_op(left, op, right) — op is the middle (int) argument
+            // yapi->bin_op(left, op, right) ; op is the middle (int) argument
             yap_expr_node args[3] = { l, bp_int_node(src, (long)sem_op, loc), r };
             return bp_yapi_call(src, "bin_op", args, 3, loc);
         }
         case yap_expr_assignment: {
             // op is a string like "=", "+=", "*="; op[0] is what yapi->assign wants
-            // ('=' means plain assign; '+' means +=, etc. — the builder appends '=').
+            // ('=' means plain assign; '+' means +=, etc. ; the builder appends '=').
             yap_expr_node l = bp_desugar_template(src, t->assignment.left, ok, eager);
             yap_expr_node r = bp_desugar_template(src, t->assignment.right, ok, eager);
             yap_expr_node args[3] = { l, bp_int_node(src, (long)t->assignment.op[0], loc), r };
@@ -1210,11 +1210,11 @@ static yap_expr yap_build_blueprint_expr(yap_source* src, yap_blueprint_node* bp
 }
 
 /* ----------------------------------------------------------------
- *  Type blueprints — the eager type${ struct/enum/union {...} } quasi-quote
+ *  Type blueprints ; the eager type${ struct/enum/union {...} } quasi-quote
  *
  *  Model A: sugar over the *construction* phase only. The body desugars into a
  *  chained yapi->struct_t()/union_t()/enum_t() + add_field/add_variant call that
- *  evaluates to a yStructT/yEnumT/yUnionT template — you then :finish("name") it
+ *  evaluates to a yStructT/yEnumT/yUnionT template ; you then :finish("name") it
  *  yourself (naming/hash/dedup/existed/methods all stay on the existing API).
  *  Eager: $T in a field/variant type splices the in-scope comptime yType now.
  * ---------------------------------------------------------------- */
@@ -1248,7 +1248,7 @@ static yap_expr_node bp_method_call(yap_source* src, yap_expr_node base, const c
 static bool bp_reject_wrapped_lazy_hole(yap_source* src, yap_type_node* subtype, bool eager, yap_loc loc){
     if (eager || !subtype || subtype->kind != yap_type_node_blueprint_hole) return false;
     yap_build_push_error(src, loc,
-        "a lazy type hole can't be wrapped in a pointer/slice/anon type yet — only a bare $T as the direct type");
+        "a lazy type hole can't be wrapped in a pointer/slice/anon type yet ; only a bare $T as the direct type");
     return true;
 }
 
@@ -1385,7 +1385,7 @@ static yap_expr yap_build_type_blueprint(yap_source* src, yap_type_blueprint_nod
 }
 
 /* ----------------------------------------------------------------
- *  Statement blueprints — the lazy stmt${ ...stmts... } quasi-quote
+ *  Statement blueprints ; the lazy stmt${ ...stmts... } quasi-quote
  *
  *  Each statement desugars to a yapi->expr_stmt/return_stmt/if_stmt/... builder
  *  call (exprs go through bp_desugar_template, so $holes become yapi->hole).
@@ -1549,7 +1549,7 @@ static yap_expr yap_build_stmt_blueprint(yap_source* src, yap_stmt_blueprint_nod
 }
 
 /* ----------------------------------------------------------------
- *  Function blueprints — the eager (RET fn$ params){body} quasi-quote
+ *  Function blueprints ; the eager (RET fn$ params){body} quasi-quote
  *
  *  Model A: sugar over the yFnT construction phase, yielding a yFnT template you
  *  :finish("name") yourself. fn_t()/add_param/set_return_type/set_body aren't
@@ -1560,7 +1560,7 @@ static yap_expr yap_build_stmt_blueprint(yap_source* src, yap_stmt_blueprint_nod
  *  eagerly splices the in-scope comptime yType (via bp_type_to_yexpr).
  * ---------------------------------------------------------------- */
 
-// Always wrap a statement sequence in yapi->block(stmt_list) — a fn body is a
+// Always wrap a statement sequence in yapi->block(stmt_list) ; a fn body is a
 // block. Always eager (true): fn$ bodies have no fill methods, so any $hole
 // here must splice immediately, not defer to a fill that could never come.
 static yap_expr_node bp_desugar_block(yap_source* src, darr(yap_statement_node) body, yap_loc loc, bool* ok){
@@ -1617,7 +1617,7 @@ static yap_expr yap_build_fn_blueprint(yap_source* src, yap_func_literal_node* f
     yap_expr_node body   = bp_desugar_block(src, fb->body.statements, loc, &ok);
     yap_expr_node sbcall = bp_method_call(src, bp_var_ref(src, ftname, loc), "set_body", &body, 1, loc);
     darr_push(stmts, bp_expr_stmt_node(src, sbcall, loc));
-    // trailing value: __fnt (the block-expr yields this — a yFnT)
+    // trailing value: __fnt (the block-expr yields this ; a yFnT)
     darr_push(stmts, bp_expr_stmt_node(src, bp_var_ref(src, ftname, loc), loc));
 
     if (!ok) return (yap_expr){ .kind = yap_expr_error };
@@ -2741,7 +2741,7 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
     *out_ret_type = func_type->func.return_type;
     if (*out_ret_type == ctx->yident_type_id){
         yap_build_push_error(src, call->loc,
-            "Macro function cannot return yIdent — identifiers can only come from +ident or yapi->uniq_name()");
+            "Macro function cannot return yIdent ; identifiers can only come from +ident or yapi->uniq_name()");
         return NULL;
     }
     if (!yap_is_comptime_type(ctx, *out_ret_type)){
@@ -2762,7 +2762,7 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
     unsigned int provided_count = darr_len(call->params) + receiver_offset;
 
     /* A trailing yExprList param may be omitted entirely at the call site
-     * (e.g. `print:(c"hi")` instead of `print:(c"hi", [])`) — it then
+     * (e.g. `print:(c"hi")` instead of `print:(c"hi", [])`) ; it then
      * defaults to an empty list, so arg_ptrs must have room for it even
      * when provided_count is one short. */
     unsigned int alloc_count = (provided_count > expected_count) ? provided_count : expected_count;
@@ -2810,14 +2810,14 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
                 } else if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_blob){
                     /* A blob literal `[a, b, c]` is built (yap_build_blob below in
                      * the literal-build path) as a darr(yap_expr) of already
-                     * type-checked elements — a contiguous array of *structs*.
+                     * type-checked elements ; a contiguous array of *structs*.
                      * A yExpr value is an 8-byte opaque handle (a pointer to one
                      * such struct, per its "void*" c_name), so the slice's data
                      * array must hold one pointer per element, not the structs
-                     * themselves — build that indirection here. Built as the real
+                     * themselves ; build that indirection here. Built as the real
                      * slice ABI shape (see yap_yexpr_slice) and passed by
                      * address, since the generic void*-per-slot dispatch below
-                     * can't carry a 2-word by-value struct directly — the
+                     * can't carry a 2-word by-value struct directly ; the
                      * callee's declared param type must be 'yExprList@', not
                      * bare 'yExprList'. */
                     unsigned int blob_count = built.literal.blob.field_count;
@@ -3193,7 +3193,7 @@ yap_type_id yap_build_type_from_type_node(yap_source* src, yap_type_node* tnode)
     return 0;
 }
 
-/* Backward-compatible shim — converts identifier node to type_node */
+/* Backward-compatible shim ; converts identifier node to type_node */
 yap_type_id yap_build_type_from_node(yap_source* src, yap_identifier_node* tnode){
     if (!tnode || !tnode->value) return 0;
     yap_ctx* ctx = src->ctx;
@@ -3247,7 +3247,7 @@ yap_struct_field yap_build_struct_field(yap_source* src, yap_var_decl_node* vn){
     yap_ctx* ctx = src->ctx;
 
     // Nameless fields: anonymous structs/unions embed their members (C11-style).
-    // Nameless enums are illegal — they declare nothing in C.
+    // Nameless enums are illegal ; they declare nothing in C.
     if (!vn->name.value){
         if (!vn->has_type || !vn->type_node){
             yap_build_push_error(src, vn->loc, "Missing field name");
