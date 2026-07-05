@@ -1894,6 +1894,23 @@ yap_expr yap_build_assignment_expr(yap_source* src, yap_assignment_node* assign)
     };
 }
 
+/* Struct/union/enum name, or (for builtin opaque comptime types like yType,
+ * yStructT, yFnT, ... which have no nominal struct/union/enum name but can
+ * still have builtin methods registered under "PrimitiveName_methodname",
+ * see ctx.c) the primitive's own declared name. Harmless for every other
+ * primitive since none has methods. Shared by real method dispatch
+ * (yap_build_method_callee) and receiver-dispatched macro calls
+ * (yap_exec_macro_call), both of which mangle "OwnerName_name" the same way. */
+static const char* yap_owner_name_for_type(yap_ctx* ctx, yap_type_id type_id){
+    yap_type* t = yap_ctx_get_type(ctx, type_id);
+    if (!t) return NULL;
+    if (t->kind == yap_type_struct) return t->structure.name;
+    if (t->kind == yap_type_union) return t->uni.name;
+    if (t->kind == yap_type_enum) return t->enumeration.name;
+    if (t->kind == yap_type_primitive) return t->primitive.name;
+    return NULL;
+}
+
 /* Resolves 'recv:name' to the mangled "TypeName_name" function var and
  * builds the receiver expression that becomes the call's first argument. */
 static yap_expr yap_build_method_callee(yap_source* src, yap_method_access_node* ma, yap_expr* out_receiver){
@@ -1903,18 +1920,7 @@ static yap_expr yap_build_method_callee(yap_source* src, yap_method_access_node*
     if (receiver.kind == yap_expr_error)
         return (yap_expr){ .kind = yap_expr_error };
 
-    yap_type* recv_type = yap_ctx_get_type(ctx, receiver.type);
-    const char* owner_name = NULL;
-    if (recv_type){
-        if (recv_type->kind == yap_type_struct) owner_name = recv_type->structure.name;
-        else if (recv_type->kind == yap_type_union) owner_name = recv_type->uni.name;
-        else if (recv_type->kind == yap_type_enum) owner_name = recv_type->enumeration.name;
-        /* Builtin opaque comptime types (yType, yStructT, yFnT, ...) have no nominal
-         * struct/union/enum name but can still have builtin methods registered under
-         * "PrimitiveName_methodname" (see ctx.c) -- fall back to the primitive's own
-         * declared name. Harmless for every other primitive since none has methods. */
-        else if (recv_type->kind == yap_type_primitive) owner_name = recv_type->primitive.name;
-    }
+    const char* owner_name = yap_owner_name_for_type(ctx, receiver.type);
     if (!owner_name || !owner_name[0]){
         char* type_str = yap_ctx_type_id_to_string(ctx, receiver.type);
         yap_build_push_error(src, ma->loc, "Type '%s' has no methods", type_str);
@@ -2601,8 +2607,82 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
         return NULL;
     }
 
-    yap_expr caller = yap_build_expr(src, call->caller);
-    if (caller.kind == yap_expr_error) return NULL;
+    /* Receiver-dispatched macro call: 'recv:name:(args)' parses 'recv:name'
+     * as a method_access caller (macro_caller already allows this in the
+     * grammar). Unlike a real method call, a macro is meant to stay generic
+     * across every instantiation of a type family (e.g. one `for` macro
+     * serves arr(i32), arr(f32), ... alike) rather than being emitted fresh
+     * per instantiation, so there's no single per-instance mangled name to
+     * find in general. Lookup tries the exact "OwnerName_name" mangle first
+     * (so a specific type can still register its own override, same
+     * convention as real methods), then falls back to the bare macro name in
+     * global scope. Either way the receiver becomes an implicit first
+     * argument (an AST-node value, exactly like a '#expr' param), ahead of
+     * whatever the call site wrote. */
+    yap_expr receiver = {0};
+    bool has_receiver = false;
+    yap_expr caller;
+
+    if (call->caller->kind == yap_expr_method_access){
+        yap_method_access_node* ma = &call->caller->method_access;
+        receiver = yap_build_expr(src, ma->caller);
+        if (receiver.kind == yap_expr_error) return NULL;
+        has_receiver = true;
+
+        const char* owner_name = yap_owner_name_for_type(ctx, receiver.type);
+        const yap_var* found = NULL;
+        char* found_emit_name = NULL;
+        if (owner_name && owner_name[0]){
+            char* mangled = yap_ctx_strus_newf(ctx, "%s_%s", owner_name, ma->name.value);
+            found = yap_scope_get_var_recursive(yap_ctx_current_scope(ctx), mangled);
+            if (found) found_emit_name = found->name;
+        }
+        if (!found){
+            found = yap_scope_get_var_recursive(ctx->global_scope, ma->name.value);
+            if (found) found_emit_name = found->name;
+        }
+        /* A macro function declared with an ordinary top-level 'fn' (like
+         * arr(T)/new(T)/for(...)) is registered into its *own module's*
+         * scope under its bare name, not ctx->global_scope directly (that's
+         * only where comptime-programmatically-built methods, e.g.
+         * yapi->new_method() &c., end up already carrying their full
+         * emit-ready name). A module scope is a sibling of global_scope, not
+         * an ancestor of the call site's scope, so no ordinary scope walk
+         * can reach it from outside that module. Since a method-macro is
+         * meant to be dispatchable from any file (like a real method), fall
+         * back to scanning every module's own scope directly for the bare
+         * name, then apply that module's prefix ourselves -- same as
+         * yap_build_module_access_expr does for an explicit 'mod->name' --
+         * since the function's *definition* was codegen'd under the
+         * prefixed name and TCC only knows it by that name. */
+        if (!found){
+            size_t iter = 0;
+            void* item;
+            while (!found && hashmap_iter(ctx->modules, &iter, &item)){
+                yap_module* mod = item;
+                if (!mod->scope) continue;
+                const yap_var* var = yap_scope_get_var(mod->scope, ma->name.value);
+                if (!var) continue;
+                found = var;
+                found_emit_name = (mod->prefix && mod->prefix[0])
+                    ? yap_ctx_strus_newf(ctx, "%s%s", mod->prefix, var->name)
+                    : var->name;
+            }
+        }
+        if (!found){
+            yap_build_push_error(src, call->loc,
+                "No method-macro '%s' found for receiver type '%s'",
+                ma->name.value, owner_name ? owner_name : "?");
+            return NULL;
+        }
+        caller = (yap_expr){
+            .kind = yap_expr_var, .var_name = found_emit_name, .type = found->type,
+            .is_lvalue = true, .is_comptime = false
+        };
+    } else {
+        caller = yap_build_expr(src, call->caller);
+        if (caller.kind == yap_expr_error) return NULL;
+    }
 
     yap_type* func_type = yap_ctx_get_type(ctx, caller.type);
     if (!func_type || func_type->kind != yap_type_func){
@@ -2624,7 +2704,14 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
 
     darr(yap_type_id) expected_args = func_type->func.args;
     unsigned int expected_count = darr_len(expected_args);
-    unsigned int provided_count = darr_len(call->params);
+    unsigned int receiver_offset = has_receiver ? 1 : 0;
+    if (has_receiver && (expected_count < 1 || expected_args[0] != ctx->yexpr_type_id)){
+        yap_build_push_error(src, call->loc,
+            "Method-macro '%s' must declare a receiver parameter of type yExpr to be called as 'recv:%s:(...)'",
+            call->caller->method_access.name.value, call->caller->method_access.name.value);
+        return NULL;
+    }
+    unsigned int provided_count = darr_len(call->params) + receiver_offset;
 
     /* A trailing yExprList param may be omitted entirely at the call site
      * (e.g. `print:(c"hi")` instead of `print:(c"hi", [])`) — it then
@@ -2635,9 +2722,13 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
     if (alloc_count > 0)
         arg_ptrs = calloc(alloc_count, sizeof(void*));
 
-    for (unsigned int i = 0; i < provided_count; i++){
+    if (has_receiver)
+        arg_ptrs[0] = yap_ctx_one_cpy(ctx, receiver);
+
+    for (unsigned int i = 0; i < darr_len(call->params); i++){
         yap_macro_param_node* param = &call->params[i];
-        yap_type_id expected_arg_type = (i < expected_count) ? expected_args[i] : 0;
+        unsigned int slot = i + receiver_offset;
+        yap_type_id expected_arg_type = (slot < expected_count) ? expected_args[slot] : 0;
         bool arg_is_type = (expected_arg_type == ctx->ytype_type_id);
 
         if (arg_is_type && param->kind == yap_macro_param_unnamed){
@@ -2649,7 +2740,7 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
                 yap_build_push_error(src, param->loc, "Cannot resolve type argument");
                 free(arg_ptrs); return NULL;
             }
-            arg_ptrs[i] = (void*)(uintptr_t)tid;
+            arg_ptrs[slot] = (void*)(uintptr_t)tid;
             continue;
         }
 
@@ -2659,15 +2750,15 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
                 if (built.kind == yap_expr_error){ free(arg_ptrs); return NULL; }
                 if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_numerical){
                     if (strchr(built.literal.text, '.'))
-                        { double v = atof(built.literal.text); double* p = yap_ctx_one(ctx, double); *p = v; arg_ptrs[i] = p; }
+                        { double v = atof(built.literal.text); double* p = yap_ctx_one(ctx, double); *p = v; arg_ptrs[slot] = p; }
                     else
-                        { long v = atol(built.literal.text); arg_ptrs[i] = (void*)(uintptr_t)v; }
+                        { long v = atol(built.literal.text); arg_ptrs[slot] = (void*)(uintptr_t)v; }
                 } else if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_string){
-                    arg_ptrs[i] = (void*)built.literal.text;
+                    arg_ptrs[slot] = (void*)built.literal.text;
                 } else if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_cstring){
-                    arg_ptrs[i] = (void*)built.literal.text;
+                    arg_ptrs[slot] = (void*)built.literal.text;
                 } else if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_bool){
-                    arg_ptrs[i] = (void*)(uintptr_t)(strus_eq(built.literal.text, "true") ? 1 : 0);
+                    arg_ptrs[slot] = (void*)(uintptr_t)(strus_eq(built.literal.text, "true") ? 1 : 0);
                 } else if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_blob){
                     /* A blob literal `[a, b, c]` is built (yap_build_blob below in
                      * the literal-build path) as a darr(yap_expr) of already
@@ -2690,7 +2781,7 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
                     yap_yexpr_slice* slice = yap_ctx_one(ctx, yap_yexpr_slice);
                     slice->data = elem_ptrs;
                     slice->len  = blob_count;
-                    arg_ptrs[i] = slice;
+                    arg_ptrs[slot] = slice;
                 } else {
                     yap_build_push_error(src, param->loc,
                         "Comptime call argument must be a literal (use #expr to pass as AST node, or [..] for a yExprList)");
@@ -2701,7 +2792,7 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
             case yap_macro_param_ast: {
                 yap_expr built = yap_build_expr(src, param->expr);
                 if (built.kind == yap_expr_error){ free(arg_ptrs); return NULL; }
-                arg_ptrs[i] = yap_ctx_one_cpy(ctx, built);
+                arg_ptrs[slot] = yap_ctx_one_cpy(ctx, built);
                 break;
             }
             case yap_macro_param_named: {
@@ -2711,7 +2802,7 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
                 }
                 yap_expr built = yap_build_expr(src, param->named.value);
                 if (built.kind == yap_expr_error){ free(arg_ptrs); return NULL; }
-                arg_ptrs[i] = yap_ctx_one_cpy(ctx, built);
+                arg_ptrs[slot] = yap_ctx_one_cpy(ctx, built);
                 break;
             }
             case yap_macro_param_ident_add: {
@@ -2724,7 +2815,7 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
                         "Identifier '%s' is already in scope (used with +ident)", name);
                     free(arg_ptrs); return NULL;
                 }
-                arg_ptrs[i] = yap_ctx_strus_cpy(ctx, name);
+                arg_ptrs[slot] = yap_ctx_strus_cpy(ctx, name);
                 break;
             }
             case yap_macro_param_mut: {
@@ -2734,7 +2825,7 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
                     yap_build_push_error(src, param->loc, "Mutable macro parameter must be an lvalue");
                     free(arg_ptrs); return NULL;
                 }
-                arg_ptrs[i] = yap_ctx_one_cpy(ctx, built);
+                arg_ptrs[slot] = yap_ctx_one_cpy(ctx, built);
                 break;
             }
             default:
