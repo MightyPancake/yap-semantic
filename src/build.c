@@ -570,6 +570,62 @@ yap_statement yap_build_statement(yap_source* src, yap_statement_node* node){
     return ret;
 }
 
+/* Walks an already-*built* statement tree (not parse nodes -- this runs
+ * after a macro has already executed and returned its yStmt result) looking
+ * for yap_statement_deferred sentinels: raw, unbuilt fragments captured from
+ * a yap_macro_param_statement macro argument (e.g. the '{ }' body of
+ * `a:for:(+i, +v, { ... });`), which couldn't be built during argument
+ * marshalling because it may reference hygienic idents the macro itself
+ * hadn't introduced yet at that point.
+ *
+ * Mirrors what yap_build_block does for ordinary parsed code -- pushes a
+ * real scope on entering a nested block, and replays var_decl into the
+ * current scope as it's walked past -- so that by the time a deferred
+ * fragment is reached (however deeply nested inside macro-constructed
+ * while/if/block statements), yap_ctx_current_scope(ctx) correctly reflects
+ * every hygienic var the macro declared ahead of it, and yap_build_statement
+ * can resolve ordinary identifier references in the deferred fragment
+ * exactly as if it had been written directly at that position in the
+ * source. Mutates the tree in place (overwrites each deferred sentinel with
+ * its built replacement). */
+static void yap_resolve_deferred_fragments(yap_source* src, yap_statement* stmt){
+    yap_ctx* ctx = src->ctx;
+    switch (stmt->kind){
+        case yap_statement_var_decl:
+            if (stmt->var_decl.kind == yap_var_decl_valid)
+                yap_ctx_push_var(ctx, stmt->var_decl.var);
+            break;
+        case yap_statement_block: {
+            yap_ctx_push_new_scope(ctx);
+            for (darr_size_t i = 0; i < darr_len(stmt->block.statements); i++)
+                yap_resolve_deferred_fragments(src, &stmt->block.statements[i]);
+            yap_ctx_pop_scope(ctx);
+            break;
+        }
+        case yap_statement_if:
+            yap_resolve_deferred_fragments(src, stmt->if_stmt.then_branch);
+            break;
+        case yap_statement_if_else:
+            yap_resolve_deferred_fragments(src, stmt->if_else_stmt.then_branch);
+            yap_resolve_deferred_fragments(src, stmt->if_else_stmt.else_branch);
+            break;
+        case yap_statement_while:
+            yap_resolve_deferred_fragments(src, stmt->while_stmt.body);
+            break;
+        case yap_statement_for:
+            yap_resolve_deferred_fragments(src, stmt->for_stmt.body);
+            break;
+        case yap_statement_deferred: {
+            yap_statement_node* raw = stmt->deferred_raw;
+            yap_statement built = yap_build_statement(src, raw);
+            *stmt = built;
+            break;
+        }
+        default:
+            break;
+    }
+}
+
 yap_statement yap_build_empty_statement(yap_source* src){
     (void)src;
     return (yap_statement){ .kind = yap_statement_empty };
@@ -612,6 +668,15 @@ yap_statement yap_build_expr_statement(yap_source* src, yap_expr_node* expr_node
                     }
                 }
             }
+            /* Resolve any yap_statement_deferred sentinels (raw macro-arg
+             * fragments, e.g. `for`'s body block) wherever they ended up
+             * nested in the returned tree. This pushes its own scope(s) as
+             * it walks -- redundant with, but harmless alongside, the
+             * flat top-level registration just above: any var_decl it
+             * re-registers lands in a scope chained *under* the real
+             * ambient one already updated above, so lookups from inside a
+             * deferred fragment still resolve correctly either way. */
+            yap_resolve_deferred_fragments(src, &ret);
             return ret;
         }
         if (ret_type_id == ctx->yexpr_type_id){
@@ -753,11 +818,23 @@ yap_statement yap_build_var_decl_statement(yap_source* src, yap_var_decl_node* v
                 "Cannot infer type of blob literal");
             return (yap_statement){ .kind = yap_statement_error };
         }
-        yap_type init_type = *init_t;
-        yap_type var_type  = yap_ctx_coerce_type(ctx, init_type);
+        /* Only untyped literals actually need coercion (yap_ctx_coerce_type
+         * is a no-op pass-through for anything else) -- re-inserting an
+         * already-concrete type's *copy* via insert_type_if_not_exists is
+         * unnecessary for a struct/union/enum, and doesn't dedupe reliably
+         * against the type's own existing entry (its structural-equality
+         * check isn't what named types rely on -- those dedupe by name via
+         * finish()), so a `_`-inferred var could end up with a *different*
+         * type_id than the initializer's own, breaking exact-type_id
+         * comparisons downstream (e.g. yapi->register_macro_method's
+         * receiver lookup). Keep init.type as-is unless coercion is
+         * actually meaningful. */
+        yap_type_id var_type_id = init.type;
+        if (init_t->kind == yap_type_untyped)
+            var_type_id = yap_ctx_insert_type_if_not_exists(ctx, yap_ctx_coerce_type(ctx, *init_t));
         var = (yap_var){
             .name = vnode->name.value,
-            .type = yap_ctx_insert_type_if_not_exists(ctx, var_type)
+            .type = var_type_id
         };
     } else {
         yap_build_push_error(src, vnode->loc,
@@ -2609,16 +2686,18 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
 
     /* Receiver-dispatched macro call: 'recv:name:(args)' parses 'recv:name'
      * as a method_access caller (macro_caller already allows this in the
-     * grammar). Unlike a real method call, a macro is meant to stay generic
-     * across every instantiation of a type family (e.g. one `for` macro
-     * serves arr(i32), arr(f32), ... alike) rather than being emitted fresh
-     * per instantiation, so there's no single per-instance mangled name to
-     * find in general. Lookup tries the exact "OwnerName_name" mangle first
-     * (so a specific type can still register its own override, same
-     * convention as real methods), then falls back to the bare macro name in
-     * global scope. Either way the receiver becomes an implicit first
-     * argument (an AST-node value, exactly like a '#expr' param), ahead of
-     * whatever the call site wrote. */
+     * grammar). A macro-method association is never inferred from the
+     * receiver's type/mangled name -- it's looked up directly in
+     * ctx->macro_methods, a table populated only by explicit
+     * yapi->register_macro_method(owner, name, backing_fn) calls (e.g. one
+     * arr(T) instantiation registering "for" for its own concrete `res`,
+     * right where it's built). That table lives entirely separately from
+     * where real per-instantiation methods (global_scope, mangled
+     * "OwnerName_name") and ordinary bare-name macros (their own module's
+     * scope) live, so a macro method and a same-named real method can never
+     * collide even in principle -- no shape-based guessing needed. The
+     * receiver becomes an implicit first argument (an AST-node value,
+     * exactly like a '#expr' param), ahead of whatever the call site wrote. */
     yap_expr receiver = {0};
     bool has_receiver = false;
     yap_expr caller;
@@ -2629,54 +2708,23 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
         if (receiver.kind == yap_expr_error) return NULL;
         has_receiver = true;
 
-        const char* owner_name = yap_owner_name_for_type(ctx, receiver.type);
-        const yap_var* found = NULL;
-        char* found_emit_name = NULL;
-        if (owner_name && owner_name[0]){
-            char* mangled = yap_ctx_strus_newf(ctx, "%s_%s", owner_name, ma->name.value);
-            found = yap_scope_get_var_recursive(yap_ctx_current_scope(ctx), mangled);
-            if (found) found_emit_name = found->name;
-        }
-        if (!found){
-            found = yap_scope_get_var_recursive(ctx->global_scope, ma->name.value);
-            if (found) found_emit_name = found->name;
-        }
-        /* A macro function declared with an ordinary top-level 'fn' (like
-         * arr(T)/new(T)/for(...)) is registered into its *own module's*
-         * scope under its bare name, not ctx->global_scope directly (that's
-         * only where comptime-programmatically-built methods, e.g.
-         * yapi->new_method() &c., end up already carrying their full
-         * emit-ready name). A module scope is a sibling of global_scope, not
-         * an ancestor of the call site's scope, so no ordinary scope walk
-         * can reach it from outside that module. Since a method-macro is
-         * meant to be dispatchable from any file (like a real method), fall
-         * back to scanning every module's own scope directly for the bare
-         * name, then apply that module's prefix ourselves -- same as
-         * yap_build_module_access_expr does for an explicit 'mod->name' --
-         * since the function's *definition* was codegen'd under the
-         * prefixed name and TCC only knows it by that name. */
-        if (!found){
-            size_t iter = 0;
-            void* item;
-            while (!found && hashmap_iter(ctx->modules, &iter, &item)){
-                yap_module* mod = item;
-                if (!mod->scope) continue;
-                const yap_var* var = yap_scope_get_var(mod->scope, ma->name.value);
-                if (!var) continue;
-                found = var;
-                found_emit_name = (mod->prefix && mod->prefix[0])
-                    ? yap_ctx_strus_newf(ctx, "%s%s", mod->prefix, var->name)
-                    : var->name;
+        yap_macro_method_entry* found = NULL;
+        for_darr(mi, entry, ctx->macro_methods){
+            if (entry.owner_type == receiver.type && strus_eq(entry.name, ma->name.value)){
+                found = &ctx->macro_methods[mi];
+                break;
             }
         }
         if (!found){
+            char* type_str = yap_ctx_type_id_to_string(ctx, receiver.type);
             yap_build_push_error(src, call->loc,
-                "No method-macro '%s' found for receiver type '%s'",
-                ma->name.value, owner_name ? owner_name : "?");
+                "No method-macro '%s' registered for receiver type '%s'",
+                ma->name.value, type_str);
+            free(type_str);
             return NULL;
         }
         caller = (yap_expr){
-            .kind = yap_expr_var, .var_name = found_emit_name, .type = found->type,
+            .kind = yap_expr_var, .var_name = found->emit_name, .type = found->func_type,
             .is_lvalue = true, .is_comptime = false
         };
     } else {
@@ -2826,6 +2874,26 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
                     free(arg_ptrs); return NULL;
                 }
                 arg_ptrs[slot] = yap_ctx_one_cpy(ctx, built);
+                break;
+            }
+            case yap_macro_param_statement: {
+                /* A raw statement/block macro arg (e.g. the '{ }' body of
+                 * `a:for:(+i, +v, { ... });`) can't be built now -- it may
+                 * reference hygienic idents (+i/+v) the macro itself hasn't
+                 * introduced yet (that only happens once the macro's
+                 * returned yStmt is spliced back in, see
+                 * yap_resolve_deferred_fragments below). Pass it through as
+                 * an opaque yStmt sentinel carrying the unbuilt parse node;
+                 * the macro can embed it anywhere in its own returned tree
+                 * (e.g. via a stmt${ }'s :fill_stmt()) with no special
+                 * awareness needed. */
+                yap_statement* deferred = yap_ctx_one(ctx, yap_statement);
+                *deferred = (yap_statement){
+                    .kind = yap_statement_deferred,
+                    .deferred_raw = param->statement,
+                    .loc = param->loc
+                };
+                arg_ptrs[slot] = deferred;
                 break;
             }
             default:
