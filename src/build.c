@@ -1669,8 +1669,8 @@ yap_expr yap_build_expr(yap_source* src, yap_expr_node* node){
         case yap_expr_cast:          ret = yap_build_cast_expr(src, &node->cast);              break;
         case yap_expr_at_op:         ret = yap_build_at_op_expr(src, &node->at_op);             break;
         case yap_expr_paren:         ret = yap_build_paren_expr(src, &node->paren);            break;
-        case yap_expr_increment:     ret = yap_build_increment_expr(src, node->increment.expr); break;
-        case yap_expr_decrement:     ret = yap_build_decrement_expr(src, node->decrement.expr); break;
+        case yap_expr_increment:     ret = yap_build_increment_expr(src, &node->increment); break;
+        case yap_expr_decrement:     ret = yap_build_decrement_expr(src, &node->decrement); break;
         case yap_expr_ternary:       ret = yap_build_ternary_expr(src, &node->ternary);         break;
         case yap_expr_member_access: ret = yap_build_member_access_expr(src, &node->member_access); break;
         case yap_expr_optional_member_access: ret = yap_build_optional_member_access_expr(src, &node->member_access); break;
@@ -2488,13 +2488,13 @@ yap_expr yap_build_paren_expr(yap_source* src, yap_paren_node* par){
     return res;
 }
 
-yap_expr yap_build_increment_expr(yap_source* src, yap_expr_node* sub){
+yap_expr yap_build_increment_expr(yap_source* src, yap_increment_node* incr){
     yap_ctx* ctx = src->ctx;
-    yap_expr expr = yap_build_expr(src, sub);
+    yap_expr expr = yap_build_expr(src, incr->expr);
     if (expr.kind == yap_expr_error) return (yap_expr){ .kind = yap_expr_error };
 
     if (!expr.is_lvalue){
-        yap_build_push_error(src, sub->loc, "Operand of increment must be an lvalue");
+        yap_build_push_error(src, incr->expr->loc, "Operand of increment must be an lvalue");
         return (yap_expr){ .kind = yap_expr_error };
     }
 
@@ -2502,17 +2502,18 @@ yap_expr yap_build_increment_expr(yap_source* src, yap_expr_node* sub){
         .kind      = yap_expr_increment,
         .subexpr   = yap_ctx_one_cpy(ctx, expr),
         .type      = expr.type,
-        .is_lvalue = false
+        .is_lvalue = false,
+        .prefix    = incr->prefix
     };
 }
 
-yap_expr yap_build_decrement_expr(yap_source* src, yap_expr_node* sub){
+yap_expr yap_build_decrement_expr(yap_source* src, yap_decrement_node* decr){
     yap_ctx* ctx = src->ctx;
-    yap_expr expr = yap_build_expr(src, sub);
+    yap_expr expr = yap_build_expr(src, decr->expr);
     if (expr.kind == yap_expr_error) return (yap_expr){ .kind = yap_expr_error };
 
     if (!expr.is_lvalue){
-        yap_build_push_error(src, sub->loc, "Operand of decrement must be an lvalue");
+        yap_build_push_error(src, decr->expr->loc, "Operand of decrement must be an lvalue");
         return (yap_expr){ .kind = yap_expr_error };
     }
 
@@ -2520,7 +2521,8 @@ yap_expr yap_build_decrement_expr(yap_source* src, yap_expr_node* sub){
         .kind      = yap_expr_decrement,
         .subexpr   = yap_ctx_one_cpy(ctx, expr),
         .type      = expr.type,
-        .is_lvalue = false
+        .is_lvalue = false,
+        .prefix    = decr->prefix
     };
 }
 
