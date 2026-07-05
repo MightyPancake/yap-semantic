@@ -1881,6 +1881,36 @@ yap_expr yap_build_var_access_expr(yap_source* src, yap_identifier_node* ident){
     };
 }
 
+// Shared desugar target for '??' (coalesce_op) and '?=' (assignment):
+// builds the ternary 'left ? left : right' - yields 'left' if it's
+// truthy/non-zero, else 'right'. 'left' is duplicated as both the condition
+// and the true-branch value, so codegen evaluates it twice if it has side
+// effects (matches the operators' spec literally).
+static yap_expr yap_build_coalesce_ternary(yap_source* src, yap_loc loc, yap_expr left, yap_expr right){
+    yap_ctx* ctx = src->ctx;
+
+    yap_type_id common = yap_ctx_find_common_type(ctx, left.type, right.type);
+    if (!common){
+        char* l_s = yap_ctx_type_id_to_string(ctx, left.type);
+        char* r_s = yap_ctx_type_id_to_string(ctx, right.type);
+        yap_build_push_error(src, loc, "Incompatible types in coalesce expression: '%s' and '%s'", l_s, r_s);
+        free(l_s); free(r_s);
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    return (yap_expr){
+        .kind    = yap_expr_ternary,
+        .ternary = (yap_ternary_expr){
+            .condition = yap_ctx_one_cpy(ctx, left),
+            .then_expr = yap_ctx_one_cpy(ctx, left),
+            .else_expr = yap_ctx_one_cpy(ctx, right)
+        },
+        .type        = common,
+        .is_lvalue   = false,
+        .is_comptime = left.is_comptime && right.is_comptime
+    };
+}
+
 yap_expr yap_build_bin_expr(yap_source* src, yap_bin_op_node* bin){
     yap_ctx* ctx = src->ctx;
 
@@ -1888,6 +1918,12 @@ yap_expr yap_build_bin_expr(yap_source* src, yap_bin_op_node* bin){
     yap_expr right = yap_build_expr(src, bin->right);
     if (left.kind == yap_expr_error || right.kind == yap_expr_error)
         return (yap_expr){ .kind = yap_expr_error };
+
+    // '??' (coalesce_op) never becomes a yap_bin_expr - it's pure sugar for
+    // a ternary, built and returned directly here instead of falling through
+    // to the generic binary-operator allow-list/common-type logic below.
+    if (bin->op == 'c')
+        return yap_build_coalesce_ternary(src, bin->loc, left, right);
 
     bool is_comparison = strchr("<>enlg", bin->op) != NULL;
     if (!strchr("+-*/%<>enlgaoLR&|^", bin->op)){
@@ -1966,6 +2002,15 @@ yap_expr yap_build_assignment_expr(yap_source* src, yap_assignment_node* assign)
         return (yap_expr){ .kind = yap_expr_error };
     }
 
+    // '?=' desugars to a plain '=' whose right side is the coalesce ternary
+    // 'left ? left : right' - i.e. only overwrite 'left' when it's falsy/zero.
+    bool is_coalesce_assign = strcmp(assign->op, "?=") == 0;
+    if (is_coalesce_assign){
+        right = yap_build_coalesce_ternary(src, assign->loc, left, right);
+        if (right.kind == yap_expr_error)
+            return (yap_expr){ .kind = yap_expr_error };
+    }
+
     // Type assignability check: right-hand side must be assignable to left.
     // Uses yap_ctx_type_id_assignable which coerces untyped types before comparison.
     if (!yap_ctx_type_id_assignable(ctx, left.type, right.type)){
@@ -1987,7 +2032,7 @@ yap_expr yap_build_assignment_expr(yap_source* src, yap_assignment_node* assign)
         .left  = yap_ctx_one_cpy(ctx, left),
         .right = yap_ctx_one_cpy(ctx, right)
     };
-    snprintf(a.op, sizeof(a.op), "%s", assign->op);
+    snprintf(a.op, sizeof(a.op), "%s", is_coalesce_assign ? "=" : assign->op);
 
     return (yap_expr){
         .kind       = yap_expr_assignment,
