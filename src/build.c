@@ -2458,6 +2458,71 @@ static yap_expr yap_build_blob_cast(yap_source* src, yap_expr blob_expr, yap_typ
     return (yap_expr){ .kind = yap_expr_error };
 }
 
+// C only allows a cast's operand and target to be scalar (or void) -- structs,
+// unions, arrays and slices are never cast targets there, only reinterpreted
+// through a pointer. Enums count as integers, function values as pointers.
+typedef enum { yap_cast_cat_int, yap_cast_cat_float, yap_cast_cat_ptr, yap_cast_cat_aggregate } yap_cast_category;
+
+static bool yap_cast_type_category(yap_ctx* ctx, yap_type_id id, yap_cast_category* out){
+    yap_type* t = yap_ctx_get_type(ctx, yap_ctx_coerce_type_id_to_id(ctx, id));
+    if (!t) return false;
+    switch (t->kind){
+        case yap_type_primitive:
+            *out = t->primitive.is_float ? yap_cast_cat_float : yap_cast_cat_int;
+            return true;
+        case yap_type_enum:
+            *out = yap_cast_cat_int;
+            return true;
+        case yap_type_ptr:
+        case yap_type_func:
+            *out = yap_cast_cat_ptr;
+            return true;
+        case yap_type_struct:
+        case yap_type_union:
+        case yap_type_array:
+        case yap_type_slice:
+        case yap_type_blob:
+            *out = yap_cast_cat_aggregate;
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Follows C's cast rules: any scalar (integer/enum, float, pointer/function)
+// casts freely to any other scalar, except float<->pointer, which C never
+// defines a conversion for. Aggregates can't be cast at all, matching C where
+// a cast's operand and target must both be scalar; casting to bare 'none' is
+// always allowed, mirroring C's universal "(void)expr" idiom.
+static bool yap_check_cast_compatible(yap_source* src, yap_loc loc, yap_type_id expr_type_id, yap_type_id target_type_id){
+    yap_ctx* ctx = src->ctx;
+    if (target_type_id == ctx->void_type_id) return true;
+
+    yap_cast_category from, to;
+    if (!yap_cast_type_category(ctx, expr_type_id, &from) || !yap_cast_type_category(ctx, target_type_id, &to))
+        return true; // unresolved/error type; already reported elsewhere
+
+    if (from == yap_cast_cat_aggregate || to == yap_cast_cat_aggregate){
+        char* from_str = yap_ctx_type_id_to_string(ctx, expr_type_id);
+        char* to_str = yap_ctx_type_id_to_string(ctx, target_type_id);
+        yap_build_push_error(src, loc, "Cannot cast '%s' to '%s': casts only work between scalar types (numbers, pointers, enums)", from_str, to_str);
+        free(from_str);
+        free(to_str);
+        return false;
+    }
+
+    if ((from == yap_cast_cat_float && to == yap_cast_cat_ptr) || (from == yap_cast_cat_ptr && to == yap_cast_cat_float)){
+        char* from_str = yap_ctx_type_id_to_string(ctx, expr_type_id);
+        char* to_str = yap_ctx_type_id_to_string(ctx, target_type_id);
+        yap_build_push_error(src, loc, "Cannot cast '%s' to '%s': a floating-point type cannot convert to or from a pointer", from_str, to_str);
+        free(from_str);
+        free(to_str);
+        return false;
+    }
+
+    return true;
+}
+
 yap_expr yap_build_cast_expr(yap_source* src, yap_cast_node* cast){
     yap_ctx* ctx = src->ctx;
 
@@ -2475,6 +2540,9 @@ yap_expr yap_build_cast_expr(yap_source* src, yap_cast_node* cast){
     if (expr_type && expr_type->kind == yap_type_blob){
         return yap_build_blob_cast(src, expr, target_type, cast->loc);
     }
+
+    if (!yap_check_cast_compatible(src, cast->loc, expr.type, target_type))
+        return (yap_expr){ .kind = yap_expr_error };
 
     return (yap_expr){
         .kind        = yap_expr_cast,
