@@ -1123,6 +1123,13 @@ static yap_expr_node bp_desugar_template(yap_source* src, yap_expr_node* t, bool
                 case '>': sem_op = yap_bin_expr_gt;  break;
                 case 'l': sem_op = yap_bin_expr_le;  break;
                 case 'g': sem_op = yap_bin_expr_ge;  break;
+                case '&': sem_op = yap_bin_expr_band; break;
+                case '|': sem_op = yap_bin_expr_bor;  break;
+                case '^': sem_op = yap_bin_expr_bxor; break;
+                case 'a': sem_op = yap_bin_expr_and;  break;
+                case 'o': sem_op = yap_bin_expr_or;   break;
+                case 'L': sem_op = yap_bin_expr_shl;  break;
+                case 'R': sem_op = yap_bin_expr_shr;  break;
                 default:
                     *ok = false;
                     yap_build_push_error(src, loc, "unsupported binary operator in blueprint");
@@ -1864,7 +1871,7 @@ yap_expr yap_build_bin_expr(yap_source* src, yap_bin_op_node* bin){
         return (yap_expr){ .kind = yap_expr_error };
 
     bool is_comparison = strchr("<>enlg", bin->op) != NULL;
-    if (!strchr("+-*/%<>enlg", bin->op)){
+    if (!strchr("+-*/%<>enlgaoLR&|^", bin->op)){
         yap_build_push_error(src, bin->loc, "Unsupported binary operator '%c'", bin->op);
         return (yap_expr){ .kind = yap_expr_error };
     }
