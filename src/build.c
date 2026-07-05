@@ -716,7 +716,7 @@ static bool yap_check_literal_range(yap_source* src, yap_loc loc, yap_expr expr,
     yap_ctx* ctx = src->ctx;
 
     bool negated = false;
-    if (expr.kind == yap_expr_unary){
+    if (expr.kind == yap_expr_unary && expr.unary_op == '-'){
         negated = true;
         expr = *expr.subexpr;
     }
@@ -1088,9 +1088,15 @@ static yap_expr_node bp_desugar_template(yap_source* src, yap_expr_node* t, bool
         case yap_expr_paren:
             return bp_desugar_template(src, t->paren.expr, ok, eager);
         case yap_expr_unary: {
-            // prefix '-' ; the only unary the parser produces today
+            // prefix '-' (neg), '!' (not), '~' (bnot)
             yap_expr_node inner = bp_desugar_template(src, t->unary.expr, ok, eager);
-            return bp_yapi_call(src, "neg", &inner, 1, loc);
+            const char* builder;
+            switch (t->unary.op){
+                case '!': builder = "not";  break;
+                case '~': builder = "bnot"; break;
+                default:  builder = "neg";  break;
+            }
+            return bp_yapi_call(src, builder, &inner, 1, loc);
         }
         case yap_expr_ternary: {
             yap_expr_node c  = bp_desugar_template(src, t->ternary.condition, ok, eager);
@@ -1967,17 +1973,39 @@ yap_expr yap_build_unary_expr(yap_source* src, yap_unary_op_node* un){
 
     yap_type_id coerced = yap_ctx_coerce_type_id_to_id(ctx, expr.type);
     yap_type* operand_type = yap_ctx_get_type(ctx, coerced);
-    bool is_numeric = operand_type && operand_type->kind == yap_type_primitive
-        && !yap_ctx_type_ids_eq(ctx, coerced, ctx->bool_type_id);
-    if (!is_numeric){
-        yap_build_push_error(src, un->loc, "Operand of unary '-' must be a numeric type");
-        return (yap_expr){ .kind = yap_expr_error };
+    yap_type_id result_type = expr.type;
+
+    if (un->op == '!'){
+        // Logical not: truthy-checks any scalar (primitive or pointer), same
+        // as C's own '!' and matching this language's existing truthy-check
+        // operators ('??'/'?=', see yap_build_coalesce_ternary, and if/while
+        // conditions) which never restrict to bool either -- codegen defers
+        // to C's native truthiness. Result is always bool.
+        bool is_scalar = operand_type
+            && (operand_type->kind == yap_type_primitive || operand_type->kind == yap_type_ptr);
+        if (!is_scalar){
+            yap_build_push_error(src, un->loc, "Operand of unary '!' must be a scalar type");
+            return (yap_expr){ .kind = yap_expr_error };
+        }
+        result_type = ctx->bool_type_id;
+    } else {
+        // '-' (negation) and '~' (bitwise not) both require a non-bool
+        // numeric operand; result keeps the operand's own type, same as '-'
+        // always did (mirrors the existing bitwise binary ops, which also
+        // don't distinguish int from float beyond this).
+        bool is_numeric = operand_type && operand_type->kind == yap_type_primitive
+            && !yap_ctx_type_ids_eq(ctx, coerced, ctx->bool_type_id);
+        if (!is_numeric){
+            yap_build_push_error(src, un->loc, "Operand of unary '%c' must be a numeric type", un->op);
+            return (yap_expr){ .kind = yap_expr_error };
+        }
     }
 
     return (yap_expr){
         .kind        = yap_expr_unary,
         .subexpr     = yap_ctx_one_cpy(ctx, expr),
-        .type        = expr.type,
+        .type        = result_type,
+        .unary_op    = un->op,
         .is_lvalue   = false,
         .is_comptime = expr.is_comptime
     };
