@@ -42,6 +42,20 @@ static void yap_build_push_error(yap_source* src, yap_loc loc, const char* fmt, 
     });
 }
 
+/* The module whose scope/prefix govern how 'src' names its own top-level
+ * declarations: the module it was imported from (modules/<name>/mod.yap),
+ * or -- for the root project's own source -- whatever module the project
+ * declared itself as via a top-level 'module{...}' block (ctx's single
+ * "current module" tracker is only ever switched to that root module, once,
+ * during import resolution; it never points at an imported module). Used
+ * everywhere a bare identifier's or call's declaring module needs to be
+ * recovered, since ctx_current_module() alone only answers that correctly
+ * for the root project itself. */
+static yap_module* yap_source_owning_module(yap_ctx* ctx, yap_source* src){
+    if (src->from_module_import) return yap_ctx_get_module(ctx, src->from_module_import);
+    return yap_ctx_current_module(ctx);
+}
+
 /*
  * Recursive post-order build: leaves first, deduplicated by origin.
  * visited_origins is a pointer-to-darr so a realloc in a deep call stays
@@ -90,14 +104,10 @@ static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(char*
 
     /* Pass 2 – build full declarations (skip comptime functions already built in Pass 1) */
     char* decl_prefix = NULL;
-    if (src->from_module_import) {
-        yap_module* src_mod = yap_ctx_get_module(ctx, src->from_module_import);
-        if (src_mod && src_mod->prefix && src_mod->prefix[0])
-            decl_prefix = src_mod->prefix;
-    } else {
-        yap_module* cur_mod = yap_ctx_current_module(ctx);
-        if (cur_mod && cur_mod->prefix[0])
-            decl_prefix = cur_mod->prefix;
+    {
+        yap_module* owning_mod = yap_source_owning_module(ctx, src);
+        if (owning_mod && owning_mod->prefix && owning_mod->prefix[0])
+            decl_prefix = owning_mod->prefix;
     }
     for_darr(j, dnode, snode->declarations){
         yap_decl decl = yap_build_decl(src, &dnode);
@@ -1854,7 +1864,7 @@ yap_expr yap_build_var_access_expr(yap_source* src, yap_identifier_node* ident){
     }
 
     char* emit_name = var->name;
-    yap_module* cur_mod = yap_ctx_current_module(ctx);
+    yap_module* cur_mod = yap_source_owning_module(ctx, src);
     if (cur_mod && cur_mod->prefix[0]
         && cur_mod->scope
         && yap_scope_get_var(cur_mod->scope, ident->value)
@@ -2051,6 +2061,21 @@ static yap_expr yap_build_method_callee(yap_source* src, yap_method_access_node*
 static yap_func_decl* yap_find_func_decl_for_call(yap_source* src, yap_expr func_expr){
     yap_ctx* ctx = src->ctx;
     if (func_expr.kind != yap_expr_var || !func_expr.var_name) return NULL;
+
+    /* A call from inside the module's own source resolves the callee through
+     * ordinary scope lookup, which gives back its bare, unprefixed registered
+     * name (Pass 1 only mangles methods, never plain module functions) -- so
+     * a declaration's own module_prefix alone can't tell us whether the
+     * CALLER's var_name needs the prefix stripped or not. Track which module
+     * (if any) src itself belongs to, so a bare name is only matched against
+     * that module's declarations, not any module in the flat decl list. */
+    const char* current_module_prefix = NULL;
+    {
+        yap_module* owning_mod = yap_source_owning_module(ctx, src);
+        if (owning_mod && owning_mod->prefix && owning_mod->prefix[0])
+            current_module_prefix = owning_mod->prefix;
+    }
+
     for (darr_size_t di = 0; di < darr_len(ctx->semantic_decls); di++){
         yap_decl* d = &ctx->semantic_decls[di];
         if ((d->kind == yap_decl_func_def || d->kind == yap_decl_func_decl) && d->func_decl.name){
@@ -2059,9 +2084,13 @@ static yap_func_decl* yap_find_func_decl_for_call(yap_source* src, yap_expr func
                 size_t plen = strlen(d->module_prefix);
                 size_t nlen = strlen(d->func_decl.name);
                 size_t vlen = strlen(func_expr.var_name);
+                // Called from outside via 'module->func(...)': var_name already carries the prefix.
                 match = (vlen == plen + nlen)
                      && memcmp(func_expr.var_name, d->module_prefix, plen) == 0
                      && memcmp(func_expr.var_name + plen, d->func_decl.name, nlen) == 0;
+                // Called by bare name from inside that same module.
+                if (!match && current_module_prefix && strcmp(current_module_prefix, d->module_prefix) == 0)
+                    match = strcmp(d->func_decl.name, func_expr.var_name) == 0;
             } else {
                 match = strcmp(d->func_decl.name, func_expr.var_name) == 0;
             }
