@@ -373,6 +373,29 @@ yap_decl yap_build_fn_def(yap_source* src, yap_func_decl_node* fnode){
         darr_push(args, yap_build_func_arg(src, &arg_node));
     }
 
+    /* main is the real process entry point: the C backend always calls it as
+     * (int argc, char** argv) and binds argc/argv into a single yap-level
+     * parameter if one is declared, so that parameter must be exactly
+     * 'byte@[] name' -- see yap_gen_func_decl in codegen.c. */
+    if (strcmp(emit_name, "main") == 0){
+        if (darr_len(args) > 1){
+            yap_build_push_error(src, fnode->loc,
+                "'main' must take either no arguments or a single 'byte@[]' argument");
+            return (yap_decl){ .kind = yap_decl_error };
+        }
+        if (darr_len(args) == 1){
+            yap_func_arg arg0 = args[0];
+            yap_type_id byte_id = yap_ctx_get_type_id_by_name(ctx, "byte");
+            yap_type_id expected = yap_ctx_get_slice_of_type_id(ctx,
+                yap_ctx_get_pointer_of_type_id(ctx, byte_id));
+            if (arg0.kind != yap_func_arg_valid || arg0.type != expected){
+                yap_build_push_error(src, fnode->loc,
+                    "'main' argument must have type 'byte@[]'");
+                return (yap_decl){ .kind = yap_decl_error };
+            }
+        }
+    }
+
     yap_scope* func_scope = yap_ctx_push_new_scope(ctx);
     for_darr(ai, arg, args){
         if (arg.kind == yap_func_arg_valid){
