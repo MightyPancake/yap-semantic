@@ -1200,11 +1200,6 @@ static yap_expr_node bp_desugar_template(yap_source* src, yap_expr_node* t, bool
         }
         case yap_expr_func_call: {
             int argc = (int)darr_len(t->func_call.args);
-            if (argc > 3){
-                *ok = false;
-                yap_build_push_error(src, loc, "call in blueprint supports up to 3 args (yapi->call0..3)");
-                return *t;
-            }
             for_darr(idx, a, t->func_call.args){
                 if (a.is_named){
                     *ok = false;
@@ -1212,12 +1207,27 @@ static yap_expr_node bp_desugar_template(yap_source* src, yap_expr_node* t, bool
                     return *t;
                 }
             }
-            yap_expr_node cargs[4];
-            cargs[0] = bp_desugar_template(src, t->func_call.func, ok, eager);
-            int ci = 0;
-            for_darr(idx, a, t->func_call.args){ cargs[1 + ci] = bp_desugar_template(src, a.value, ok, eager); ci++; }
-            const char* callname = argc == 0 ? "call0" : argc == 1 ? "call1" : argc == 2 ? "call2" : "call3";
-            return bp_yapi_call(src, callname, cargs, argc + 1, loc);
+            yap_expr_node func_node = bp_desugar_template(src, t->func_call.func, ok, eager);
+            if (argc <= 3){
+                yap_expr_node cargs[4];
+                cargs[0] = func_node;
+                int ci = 0;
+                for_darr(idx, a, t->func_call.args){ cargs[1 + ci] = bp_desugar_template(src, a.value, ok, eager); ci++; }
+                const char* callname = argc == 0 ? "call0" : argc == 1 ? "call1" : argc == 2 ? "call2" : "call3";
+                return bp_yapi_call(src, callname, cargs, argc + 1, loc);
+            }
+            // >3 args: no fixed-arity callN covers this -- fold the args into a
+            // yCallArgs list via call_args_new/call_args_push (each push returns
+            // the same list, so this chains as nested expressions) and hand it
+            // to the general yapi->call(func, args).
+            yap_expr_node list_node = bp_yapi_call(src, "call_args_new", NULL, 0, loc);
+            for_darr(idx, a, t->func_call.args){
+                yap_expr_node arg_node = bp_desugar_template(src, a.value, ok, eager);
+                yap_expr_node push_args[2] = { list_node, arg_node };
+                list_node = bp_yapi_call(src, "call_args_push", push_args, 2, loc);
+            }
+            yap_expr_node call_args[2] = { func_node, list_node };
+            return bp_yapi_call(src, "call", call_args, 2, loc);
         }
         default:
             *ok = false;
