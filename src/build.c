@@ -2919,16 +2919,18 @@ static bool yap_is_comptime_type(yap_ctx* ctx, yap_type_id id){
 typedef struct { void* data; unsigned long len; } yap_yexpr_slice;
 
 /* Resolves a macro-call argument written in a yType-expecting slot, e.g.
- * `pair:(i32, i32)` or `hashmap:(byte@, V)`. The grammar parses every macro
- * argument as an ordinary expression (macro_param's unnamed_param rule is
- * just `$._expr` -- there's no separate "type expression" alternative), so
- * `byte@` arrives as an at_op node (the same postfix '@' used for address-of
- * elsewhere) wrapping a var node for "byte", not as any kind of type node.
- * A bare identifier (`i32`) is the base case; an at_op wraps one more level
- * of pointer-of around whatever its inner expr resolves to, so `byte@@`
+ * `pair:(i32, i32)` or `hashmap:(byte@, V)`, when the argument parsed as an
+ * ordinary expression (macro_param's unnamed_param, `$._expr` -- there's no
+ * separate "type expression" alternative for these shapes since bare
+ * identifiers/pointer-of are already valid expressions). `byte@` arrives as
+ * an at_op node (the same postfix '@' used for address-of elsewhere)
+ * wrapping a var node for "byte", not as any kind of type node. A bare
+ * identifier (`i32`) is the base case; an at_op wraps one more level of
+ * pointer-of around whatever its inner expr resolves to, so `byte@@`
  * (recursing twice) works the same way. Returns 0 (unresolved) for anything
- * else -- e.g. array/slice type spellings aren't attempted here, since nothing
- * currently needs them as a macro type argument. */
+ * else. Array/slice/function-type spellings (`i32[4]`, `(i32 fn i32)`) parse
+ * as a distinct yap_macro_param_type (they have no _expr equivalent) and are
+ * resolved via yap_build_type_from_type_node instead -- see the caller. */
 static yap_type_id yap_resolve_macro_type_arg(yap_ctx* ctx, yap_expr_node* expr){
     if (!expr) return 0;
     if (expr->kind == yap_expr_var && expr->var.value)
@@ -3045,8 +3047,10 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
         yap_type_id expected_arg_type = (slot < expected_count) ? expected_args[slot] : 0;
         bool arg_is_type = (expected_arg_type == ctx->ytype_type_id);
 
-        if (arg_is_type && param->kind == yap_macro_param_unnamed){
-            yap_type_id tid = yap_resolve_macro_type_arg(ctx, param->expr);
+        if (arg_is_type && (param->kind == yap_macro_param_unnamed || param->kind == yap_macro_param_type)){
+            yap_type_id tid = (param->kind == yap_macro_param_type)
+                ? yap_build_type_from_type_node(src, param->type_node)
+                : yap_resolve_macro_type_arg(ctx, param->expr);
             if (!tid){
                 yap_build_push_error(src, param->loc, "Cannot resolve type argument");
                 free(arg_ptrs); return NULL;
@@ -3056,6 +3060,10 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
         }
 
         switch (param->kind){
+            case yap_macro_param_type: {
+                yap_build_push_error(src, param->loc, "Type argument provided where a value was expected");
+                free(arg_ptrs); return NULL;
+            }
             case yap_macro_param_unnamed: {
                 yap_expr built = yap_build_expr(src, param->expr);
                 if (built.kind == yap_expr_error){ free(arg_ptrs); return NULL; }
