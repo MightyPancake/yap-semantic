@@ -7,6 +7,7 @@ static yap_expr yap_build_blob_cast(yap_source* src, yap_expr blob_expr, yap_typ
 static yap_expr yap_build_macro_expr(yap_source* src, yap_macro_call_node* call);
 static bool yap_is_comptime_type(yap_ctx* ctx, yap_type_id id);
 static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap_type_id* out_ret_type);
+static yap_type_id yap_build_macro_type(yap_source* src, yap_macro_call_node* call);
 yap_type_id yap_build_type_from_type_node(yap_source* src, yap_type_node* tnode);
 
 /*
@@ -2922,23 +2923,34 @@ typedef struct { void* data; unsigned long len; } yap_yexpr_slice;
  * `pair:(i32, i32)` or `hashmap:(byte@, V)`, when the argument parsed as an
  * ordinary expression (macro_param's unnamed_param, `$._expr` -- there's no
  * separate "type expression" alternative for these shapes since bare
- * identifiers/pointer-of are already valid expressions). `byte@` arrives as
- * an at_op node (the same postfix '@' used for address-of elsewhere)
- * wrapping a var node for "byte", not as any kind of type node. A bare
- * identifier (`i32`) is the base case; an at_op wraps one more level of
- * pointer-of around whatever its inner expr resolves to, so `byte@@`
- * (recursing twice) works the same way. Returns 0 (unresolved) for anything
- * else. Array/slice/function-type spellings (`i32[4]`, `(i32 fn i32)`) parse
+ * identifiers/pointer-of/parens/nested-macro-calls are already valid
+ * expressions). `byte@` arrives as an at_op node (the same postfix '@' used
+ * for address-of elsewhere) wrapping a var node for "byte", not as any kind
+ * of type node. A bare identifier (`i32`) is the base case; an at_op wraps
+ * one more level of pointer-of around whatever its inner expr resolves to,
+ * so `byte@@` (recursing twice) works the same way. A paren_expr (`(i32)`)
+ * just unwraps to its inner expr. A nested macro call (`outer:(inner:(i32))`)
+ * is actually executed via yap_build_macro_type -- same entrypoint used when
+ * a macro call appears in real type position -- and its returned yType is
+ * taken directly. Returns 0 (unresolved) for anything else. Array/slice/
+ * function/const-type spellings (`i32[4]`, `(i32 fn i32)`, `i32 const`) parse
  * as a distinct yap_macro_param_type (they have no _expr equivalent) and are
  * resolved via yap_build_type_from_type_node instead -- see the caller. */
-static yap_type_id yap_resolve_macro_type_arg(yap_ctx* ctx, yap_expr_node* expr){
+static yap_type_id yap_resolve_macro_type_arg(yap_source* src, yap_expr_node* expr){
+    yap_ctx* ctx = src->ctx;
     if (!expr) return 0;
     if (expr->kind == yap_expr_var && expr->var.value)
         return yap_ctx_get_type_id_by_name(ctx, expr->var.value);
     if (expr->kind == yap_expr_at_op){
-        yap_type_id inner = yap_resolve_macro_type_arg(ctx, expr->at_op.expr);
+        yap_type_id inner = yap_resolve_macro_type_arg(src, expr->at_op.expr);
         if (!inner) return 0;
         return yap_ctx_get_pointer_of_type_id(ctx, inner);
+    }
+    if (expr->kind == yap_expr_paren){
+        return yap_resolve_macro_type_arg(src, expr->paren.expr);
+    }
+    if (expr->kind == yap_expr_macro){
+        return yap_build_macro_type(src, &expr->macro_call);
     }
     return 0;
 }
@@ -3050,7 +3062,7 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
         if (arg_is_type && (param->kind == yap_macro_param_unnamed || param->kind == yap_macro_param_type)){
             yap_type_id tid = (param->kind == yap_macro_param_type)
                 ? yap_build_type_from_type_node(src, param->type_node)
-                : yap_resolve_macro_type_arg(ctx, param->expr);
+                : yap_resolve_macro_type_arg(src, param->expr);
             if (!tid){
                 yap_build_push_error(src, param->loc, "Cannot resolve type argument");
                 free(arg_ptrs); return NULL;
