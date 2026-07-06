@@ -2918,6 +2918,29 @@ static bool yap_is_comptime_type(yap_ctx* ctx, yap_type_id id){
  * must be a pointer to the slice (e.g. 'yExprList@'), not the slice itself. */
 typedef struct { void* data; unsigned long len; } yap_yexpr_slice;
 
+/* Resolves a macro-call argument written in a yType-expecting slot, e.g.
+ * `pair:(i32, i32)` or `hashmap:(byte@, V)`. The grammar parses every macro
+ * argument as an ordinary expression (macro_param's unnamed_param rule is
+ * just `$._expr` -- there's no separate "type expression" alternative), so
+ * `byte@` arrives as an at_op node (the same postfix '@' used for address-of
+ * elsewhere) wrapping a var node for "byte", not as any kind of type node.
+ * A bare identifier (`i32`) is the base case; an at_op wraps one more level
+ * of pointer-of around whatever its inner expr resolves to, so `byte@@`
+ * (recursing twice) works the same way. Returns 0 (unresolved) for anything
+ * else -- e.g. array/slice type spellings aren't attempted here, since nothing
+ * currently needs them as a macro type argument. */
+static yap_type_id yap_resolve_macro_type_arg(yap_ctx* ctx, yap_expr_node* expr){
+    if (!expr) return 0;
+    if (expr->kind == yap_expr_var && expr->var.value)
+        return yap_ctx_get_type_id_by_name(ctx, expr->var.value);
+    if (expr->kind == yap_expr_at_op){
+        yap_type_id inner = yap_resolve_macro_type_arg(ctx, expr->at_op.expr);
+        if (!inner) return 0;
+        return yap_ctx_get_pointer_of_type_id(ctx, inner);
+    }
+    return 0;
+}
+
 static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap_type_id* out_ret_type){
     yap_ctx* ctx = src->ctx;
     *out_ret_type = 0;
@@ -3023,10 +3046,7 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
         bool arg_is_type = (expected_arg_type == ctx->ytype_type_id);
 
         if (arg_is_type && param->kind == yap_macro_param_unnamed){
-            yap_type_id tid = 0;
-            if (param->expr->kind == yap_expr_var && param->expr->var.value){
-                tid = yap_ctx_get_type_id_by_name(ctx, param->expr->var.value);
-            }
+            yap_type_id tid = yap_resolve_macro_type_arg(ctx, param->expr);
             if (!tid){
                 yap_build_push_error(src, param->loc, "Cannot resolve type argument");
                 free(arg_ptrs); return NULL;
