@@ -469,6 +469,40 @@ yap_decl yap_build_fn_declaration(yap_source* src, yap_func_decl_node* fnode){
     };
 }
 
+/* Pass 1 (yap_build_pass1_collect, above) registers a forward-declaration
+ * placeholder for every named type before any declaration's body is built,
+ * specifically so a struct/union can reference itself (or another
+ * not-yet-built type) inside its own field list -- e.g. 'Node@ left' inside
+ * 'struct Node'. That self-reference necessarily resolves and interns a
+ * pointer type ('Node@') while 'Node' still only exists as the placeholder
+ * (empty fields), *before* this function (Pass 2) builds the real one.
+ *
+ * Pointer/struct type interning (yap_ctx_insert_type_if_not_exists) dedupes
+ * purely by a mangled name string ("P4Node"), not by type id, so that
+ * earlier pointer type is permanently cached under the same key any later
+ * 'Node@' will look up -- if Pass 2 pushed a *new* type id for the finished
+ * struct and merely rebound the name "Node" to it, every pointer type built
+ * before this point (including the struct's own self-referential field)
+ * would keep pointing at the empty placeholder forever, since nothing ever
+ * revisits already-interned pointer types. Named-type equality checks
+ * (yap_ctx_types_eq) compare structs by name only, so this mismatch stays
+ * invisible until something actually reads the pointee's field list, e.g.
+ * chaining a deref straight into a member access ('ptr.field' where 'ptr'
+ * is itself a dereferenced pointer) -- which then walks a NULL fields darr
+ * and crashes.
+ *
+ * Fix: complete the placeholder *in place* (same type id) instead of
+ * replacing it, so anything that already captured that id transparently
+ * observes the finished type. */
+static yap_type_id yap_finish_named_type(yap_ctx* ctx, char* name, yap_type t){
+    yap_type_id existing_id = yap_ctx_get_type_id_by_name(ctx, name);
+    if (existing_id){
+        *yap_ctx_get_type(ctx, existing_id) = t;
+        return existing_id;
+    }
+    return yap_ctx_push_named_type(ctx, name, name, t);
+}
+
 yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tnode){
     yap_ctx* ctx = src->ctx;
     char* name = (char*)(tnode->name.value ? tnode->name.value : "(anon)");
@@ -486,7 +520,7 @@ yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tn
                 .c_name = name,
                 .name   = name
             };
-            yap_type_id id = yap_ctx_push_named_type(ctx, name, name, t);
+            yap_type_id id = yap_finish_named_type(ctx, name, t);
             return (yap_decl){
                 .kind = yap_decl_named_type,
                 .named_type_decl = (yap_named_type_decl){
@@ -509,7 +543,7 @@ yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tn
                 .c_name   = name,
                 .name     = name
             };
-            yap_type_id id = yap_ctx_push_named_type(ctx, name, name, t);
+            yap_type_id id = yap_finish_named_type(ctx, name, t);
             return (yap_decl){
                 .kind = yap_decl_named_type,
                 .named_type_decl = (yap_named_type_decl){
@@ -532,7 +566,7 @@ yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tn
                 .c_name   = name,
                 .name     = name
             };
-            yap_type_id id = yap_ctx_push_named_type(ctx, name, name, t);
+            yap_type_id id = yap_finish_named_type(ctx, name, t);
             return (yap_decl){
                 .kind = yap_decl_named_type,
                 .named_type_decl = (yap_named_type_decl){
@@ -550,7 +584,7 @@ yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tn
                 .c_name = name,
                 .name   = name
             };
-            yap_type_id id = yap_ctx_push_named_type(ctx, name, name, t);
+            yap_type_id id = yap_finish_named_type(ctx, name, t);
             return (yap_decl){
                 .kind = yap_decl_named_type,
                 .named_type_decl = (yap_named_type_decl){
@@ -2698,6 +2732,29 @@ yap_expr yap_build_member_access_expr(yap_source* src, yap_member_access_node* m
     if (object.kind == yap_expr_error) return (yap_expr){ .kind = yap_expr_error };
 
     yap_type* obj_type = yap_ctx_get_type(ctx, object.type);
+
+    /* Auto-deref: 'ptr.field' transparently dereferences a pointer to a
+     * struct/union before accessing the member, same as Go (and unlike C,
+     * which needs a separate '->'; this language's '->' is already taken
+     * for module access, e.g. 'io->print'). Synthesize the same deref_expr
+     * yap_build_deref_expr itself would build, then keep going as if
+     * 'object' had been the dereferenced struct/union all along -- 'ptr..field'
+     * (an explicit deref chained into a member access) still works too,
+     * since by the time it reaches here 'object' is already struct-typed
+     * and this branch simply doesn't trigger. */
+    if (obj_type && obj_type->kind == yap_type_ptr){
+        yap_type* pointee_type = yap_ctx_get_type(ctx, obj_type->pointer_type);
+        if (pointee_type && (pointee_type->kind == yap_type_struct || pointee_type->kind == yap_type_union)){
+            object = (yap_expr){
+                .kind        = yap_expr_deref,
+                .subexpr     = yap_ctx_one_cpy(ctx, object),
+                .type        = obj_type->pointer_type,
+                .is_lvalue   = true,
+                .is_comptime = false
+            };
+            obj_type = pointee_type;
+        }
+    }
 
     /* Slices (e.g. string literals, yExprList) codegen to a real
      * 'struct { T* data; unsigned long len; }' (yap_gen_name_type_combo's
