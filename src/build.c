@@ -10,16 +10,10 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
 static yap_type_id yap_build_macro_type(yap_source* src, yap_macro_call_node* call);
 yap_type_id yap_build_type_from_type_node(yap_source* src, yap_type_node* tnode);
 
-/*
- * Empty-type helper (not yet declared in ctx.h, defined in ctx.c).
- */
 static yap_type yap_empty_type(yap_type_kind kind){
     return (yap_type){ .kind = kind, .is_const = false };
 }
 
-/*
- * Error helper – push a positioned error to ctx.
- */
 static void yap_build_push_error(yap_source* src, yap_loc loc, const char* fmt, ...){
     if (!src || !src->ctx || !fmt) return;
     yap_ctx* ctx = src->ctx;
@@ -43,25 +37,13 @@ static void yap_build_push_error(yap_source* src, yap_loc loc, const char* fmt, 
     });
 }
 
-/* The module whose scope/prefix govern how 'src' names its own top-level
- * declarations: the module it was imported from (modules/<name>/mod.yap),
- * or -- for the root project's own source -- whatever module the project
- * declared itself as via a top-level 'module{...}' block (ctx's single
- * "current module" tracker is only ever switched to that root module, once,
- * during import resolution; it never points at an imported module). Used
- * everywhere a bare identifier's or call's declaring module needs to be
- * recovered, since ctx_current_module() alone only answers that correctly
- * for the root project itself. */
+/* ctx_current_module() only ever points at the root project's own module, never an imported one, so callers needing the declaring module of an arbitrary 'src' must go through this instead. */
 static yap_module* yap_source_owning_module(yap_ctx* ctx, yap_source* src){
     if (src->from_module_import) return yap_ctx_get_module(ctx, src->from_module_import);
     return yap_ctx_current_module(ctx);
 }
 
-/*
- * Recursive post-order build: leaves first, deduplicated by origin.
- * visited_origins is a pointer-to-darr so a realloc in a deep call stays
- * visible to shallower frames instead of leaving them a dangling pointer.
- */
+/* visited_origins is passed as pointer-to-darr so a realloc in a deep call stays visible to shallower frames instead of leaving them a dangling pointer. */
 static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(char*)* visited_origins){
     if (!src || !src->source_node) return;
 
@@ -125,9 +107,6 @@ static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(char*
     }
 }
 
-/*
- * Top-level entry point.
- */
 yap_ctx* yap_build(yap_ctx* ctx, yap_args args){
     (void)args;
     yap_log("\n\nBuild phase\n");
@@ -175,12 +154,7 @@ static const char* yap_named_type_owner_name(yap_type* t){
     return NULL;
 }
 
-/* Functions declared with an explicit 'subj_type subj_name:' subject become
- * methods: only reachable as 'recv:name(args)', registered under a mangled
- * "TypeName_funcname" symbol so each type can have its own function of that
- * name. Computed independently (not cached on the AST node) so Pass 1 and
- * Pass 2 - which each iterate their own by-value copy of the declaration -
- * agree on the same name. */
+/* Method functions (explicit 'subj_type subj_name:' subject) mangle to "TypeName_funcname"; recomputed here rather than cached on the AST node so Pass 1 and Pass 2 (each iterating their own by-value copy of the declaration) agree on the same name. */
 static char* yap_func_decl_emit_name(yap_ctx* ctx, yap_func_decl_node* fnode){
     if (!fnode->has_subject || !fnode->subject_type_node
         || fnode->subject_type_node->kind != yap_type_node_identifier
@@ -373,10 +347,7 @@ yap_decl yap_build_fn_def(yap_source* src, yap_func_decl_node* fnode){
         darr_push(args, yap_build_func_arg(src, &arg_node));
     }
 
-    /* main is the real process entry point: the C backend always calls it as
-     * (int argc, char** argv) and binds argc/argv into a single yap-level
-     * parameter if one is declared, so that parameter must be exactly
-     * 'byte@[] name' -- see yap_gen_func_decl in codegen.c. */
+    /* The C backend always calls main as (int argc, char** argv) and binds both into a single declared yap-level parameter, so that parameter must be exactly 'byte@[]'. */
     if (strcmp(emit_name, "main") == 0){
         if (darr_len(args) > 1){
             yap_build_push_error(src, fnode->loc,
@@ -469,31 +440,7 @@ yap_decl yap_build_fn_declaration(yap_source* src, yap_func_decl_node* fnode){
     };
 }
 
-/* Pass 1 (yap_build_pass1_collect, above) registers a forward-declaration
- * placeholder for every named type before any declaration's body is built,
- * specifically so a struct/union can reference itself (or another
- * not-yet-built type) inside its own field list -- e.g. 'Node@ left' inside
- * 'struct Node'. That self-reference necessarily resolves and interns a
- * pointer type ('Node@') while 'Node' still only exists as the placeholder
- * (empty fields), *before* this function (Pass 2) builds the real one.
- *
- * Pointer/struct type interning (yap_ctx_insert_type_if_not_exists) dedupes
- * purely by a mangled name string ("P4Node"), not by type id, so that
- * earlier pointer type is permanently cached under the same key any later
- * 'Node@' will look up -- if Pass 2 pushed a *new* type id for the finished
- * struct and merely rebound the name "Node" to it, every pointer type built
- * before this point (including the struct's own self-referential field)
- * would keep pointing at the empty placeholder forever, since nothing ever
- * revisits already-interned pointer types. Named-type equality checks
- * (yap_ctx_types_eq) compare structs by name only, so this mismatch stays
- * invisible until something actually reads the pointee's field list, e.g.
- * chaining a deref straight into a member access ('ptr.field' where 'ptr'
- * is itself a dereferenced pointer) -- which then walks a NULL fields darr
- * and crashes.
- *
- * Fix: complete the placeholder *in place* (same type id) instead of
- * replacing it, so anything that already captured that id transparently
- * observes the finished type. */
+/* Complete the placeholder type in place (same type id), don't replace it: pointer/struct interning dedupes by mangled name, so a fresh id here would strand every pointer type interned before completion (e.g. a self-referential 'Node@ left' field built during Pass 1). */
 static yap_type_id yap_finish_named_type(yap_ctx* ctx, char* name, yap_type t){
     yap_type_id existing_id = yap_ctx_get_type_id_by_name(ctx, name);
     if (existing_id){
@@ -638,24 +585,7 @@ yap_statement yap_build_statement(yap_source* src, yap_statement_node* node){
     return ret;
 }
 
-/* Walks an already-*built* statement tree (not parse nodes -- this runs
- * after a macro has already executed and returned its yStmt result) looking
- * for yap_statement_deferred sentinels: raw, unbuilt fragments captured from
- * a yap_macro_param_statement macro argument (e.g. the '{ }' body of
- * `a:for:(+i, +v, { ... });`), which couldn't be built during argument
- * marshalling because it may reference hygienic idents the macro itself
- * hadn't introduced yet at that point.
- *
- * Mirrors what yap_build_block does for ordinary parsed code -- pushes a
- * real scope on entering a nested block, and replays var_decl into the
- * current scope as it's walked past -- so that by the time a deferred
- * fragment is reached (however deeply nested inside macro-constructed
- * while/if/block statements), yap_ctx_current_scope(ctx) correctly reflects
- * every hygienic var the macro declared ahead of it, and yap_build_statement
- * can resolve ordinary identifier references in the deferred fragment
- * exactly as if it had been written directly at that position in the
- * source. Mutates the tree in place (overwrites each deferred sentinel with
- * its built replacement). */
+/* Walks an already-built statement tree looking for yap_statement_deferred sentinels: raw macro-arg fragments (e.g. a `for`'s '{ }' body) that couldn't be built during argument marshalling because they may reference hygienic idents the macro hadn't introduced yet. Replays scopes/var_decls on the way down so each deferred fragment builds with the same scope it would have had inline, then overwrites the sentinel in place. */
 static void yap_resolve_deferred_fragments(yap_source* src, yap_statement* stmt){
     yap_ctx* ctx = src->ctx;
     switch (stmt->kind){
@@ -721,14 +651,7 @@ yap_statement yap_build_expr_statement(yap_source* src, yap_expr_node* expr_node
                 yap_ctx_push_var(ctx, ret.var_decl.var);
                 yap_log("Macro introduced variable '%s' into scope", ret.var_decl.var.name);
             } else if (ret.kind == yap_statement_block && ret.block.kind == yap_block_valid){
-                /* A macro-returned yStmt may be a flat block wrapping a
-                 * var_decl alongside other statements (e.g. stmt${ }'s
-                 * var_decl-with-initializer, desugared as declare-then-assign
-                 * -- see bp_wrap_stmts_in_block in this file). Only the
-                 * top-level statements of THIS block are in the caller's flat
-                 * scope (a var_decl nested inside an if/while stays properly
-                 * scoped to its own block, same as ordinary code), so this
-                 * doesn't recurse into nested branches. */
+                /* Only top-level statements of this returned block join the caller's flat scope; nested if/while blocks stay scoped normally, so this doesn't recurse. */
                 for_darr(i, st, ret.block.statements){
                     if (st.kind == yap_statement_var_decl && st.var_decl.kind == yap_var_decl_valid){
                         yap_ctx_push_var(ctx, st.var_decl.var);
@@ -736,14 +659,7 @@ yap_statement yap_build_expr_statement(yap_source* src, yap_expr_node* expr_node
                     }
                 }
             }
-            /* Resolve any yap_statement_deferred sentinels (raw macro-arg
-             * fragments, e.g. `for`'s body block) wherever they ended up
-             * nested in the returned tree. This pushes its own scope(s) as
-             * it walks -- redundant with, but harmless alongside, the
-             * flat top-level registration just above: any var_decl it
-             * re-registers lands in a scope chained *under* the real
-             * ambient one already updated above, so lookups from inside a
-             * deferred fragment still resolve correctly either way. */
+            /* Redundant but harmless alongside the flat top-level registration above: re-registered var_decls just land in a scope chained under the already-updated ambient one. */
             yap_resolve_deferred_fragments(src, &ret);
             return ret;
         }
@@ -886,17 +802,7 @@ yap_statement yap_build_var_decl_statement(yap_source* src, yap_var_decl_node* v
                 "Cannot infer type of blob literal");
             return (yap_statement){ .kind = yap_statement_error };
         }
-        /* Only untyped literals actually need coercion (yap_ctx_coerce_type
-         * is a no-op pass-through for anything else) -- re-inserting an
-         * already-concrete type's *copy* via insert_type_if_not_exists is
-         * unnecessary for a struct/union/enum, and doesn't dedupe reliably
-         * against the type's own existing entry (its structural-equality
-         * check isn't what named types rely on -- those dedupe by name via
-         * finish()), so a `_`-inferred var could end up with a *different*
-         * type_id than the initializer's own, breaking exact-type_id
-         * comparisons downstream (e.g. yapi->register_macro_method's
-         * receiver lookup). Keep init.type as-is unless coercion is
-         * actually meaningful. */
+        /* Keep init.type as-is unless coercion is meaningful (only untyped literals need it): re-inserting an already-concrete struct/union/enum type doesn't dedupe reliably against its own named-type entry (those dedupe by name, not structural equality), which would hand a `_`-inferred var a different type_id than the initializer's, breaking exact-type_id comparisons downstream (e.g. register_macro_method's receiver lookup). */
         yap_type_id var_type_id = init.type;
         if (init_t->kind == yap_type_untyped)
             var_type_id = yap_ctx_insert_type_if_not_exists(ctx, yap_ctx_coerce_type(ctx, *init_t));
@@ -1068,18 +974,6 @@ yap_statement yap_build_block_statement(yap_source* src, yap_block_node* bnode){
 
 /* ----------------------------------------------------------------
  *  Blueprints ; the $(...) quasi-quote literal
- *
- *  A blueprint is pure sugar over the yapi-> builder API: $(...) is rewritten
- *  into ordinary yapi->hole/int/bin_op/... calls (parse nodes) that are built
- *  normally, so they codegen into the enclosing macro's body and run under TCC
- *  like any hand-written builder call. The result is stamped yExprBlueprint
- *  (which shares a C representation with yExpr ; both are yap_expr*), so the
- *  only front-end bridging is this one type override.
- *
- *  Filling and finishing are NOT handled here: they are ordinary methods on
- *  yExprBlueprint (yExprBlueprint_fill / yExprBlueprint_finish, registered in
- *  ctx.c, implemented in build_state.c) dispatched through the normal
- *  obj:method(args) path ; e.g. $($x+1):fill(c"x", a):finish().
  * ---------------------------------------------------------------- */
 
 // yapi->NAME(args...) as a parse node.
@@ -1113,21 +1007,11 @@ static yap_expr_node bp_int_node(yap_source* src, long v, yap_loc loc){
         .loc = loc };
 }
 
-// `eager`: type${}/fn$ pass true ($T -> bare var-ref, resolved immediately --
-// unchanged, Model A stays eager-only there); the new lazy var_decl path
-// (stmt${ }) and casts reached from a lazy expr${ }/stmt${ } template pass
-// false ($T -> yapi->type_hole(c"T"), closed later via :fill_type()).
+// `eager`: type${}/fn$ pass true ($T resolved immediately, bare var-ref); lazy stmt${}/expr${} templates pass false ($T -> yapi->type_hole, closed later via :fill_type()).
 static yap_expr_node bp_type_to_yexpr(yap_source* src, yap_type_node* t, bool* ok, bool eager); // fwd (used by cast)
 static yap_expr_node bp_build_type_body_chain(yap_source* src, yap_type_node* body, bool* ok, bool eager); // fwd (mutually recursive w/ bp_type_to_yexpr, for anon nested fields)
 
-// Rewrite a blueprint template expr into the yapi-> builder call that rebuilds
-// it. Supports literals, variable refs, holes, parens, unary minus, ternary,
-// binary arithmetic + comparisons, and (added for stmt${ }/fn$ bodies)
-// assignment, member/index, deref, address-of, cast, and calls (<=3 args).
-// `eager`: expr${ }/stmt${ } pass false ($name -> yapi->hole(...), a lazy hole
-// closed later via :fill_expr()); fn$ passes true for its body ($name -> a
-// bare var-ref to the in-scope comptime value, spliced immediately ; fn$ has
-// no fill methods at all, so a hole here could never be closed).
+// `eager`: expr${}/stmt${} pass false ($name -> a lazy yapi->hole closed later via :fill_expr()); fn$ passes true ($name -> bare var-ref spliced immediately, since fn$ has no fill methods to close a hole later).
 static yap_expr_node bp_desugar_template(yap_source* src, yap_expr_node* t, bool* ok, bool eager){
     yap_ctx* ctx = src->ctx;
     yap_loc loc = t->loc;
@@ -1180,11 +1064,7 @@ static yap_expr_node bp_desugar_template(yap_source* src, yap_expr_node* t, bool
             }
         }
         case yap_expr_bin: {
-            // The parse-AST op is a single char: arithmetic ops keep their ASCII
-            // value (which equals the semtree op enum), while comparisons were
-            // remapped by the parser (== -> 'e', != -> 'n', <= -> 'l', >= -> 'g',
-            // < -> '<', > -> '>'). yapi->bin_op wants the *semtree* op enum, so
-            // translate here.
+            // Arithmetic ops keep their ASCII value (equal to the semtree op enum); comparisons were remapped by the parser to non-ASCII tags ('e','n','l','g'), so translate those here.
             int sem_op;
             switch (t->bin.op){
                 case '+': sem_op = yap_bin_expr_add; break;
@@ -1246,11 +1126,7 @@ static yap_expr_node bp_desugar_template(yap_source* src, yap_expr_node* t, bool
         }
         case yap_expr_cast: {
             yap_expr_node inner = bp_desugar_template(src, t->cast.expr, ok, eager);
-            // A cast's $T used to always eagerly splice regardless of the
-            // enclosing template's own eagerness -- a shortcut from before
-            // type holes existed. Now it follows the ambient `eager` like
-            // everything else: lazy inside expr${ }/stmt${ } (closed later via
-            // :fill_type()), still eager inside fn$ bodies.
+            // A cast's $T follows the ambient `eager` like everything else, not always-eager.
             yap_expr_node ty    = bp_type_to_yexpr(src, t->cast.type_node, ok, eager);
             yap_expr_node args[2] = { inner, ty };
             return bp_yapi_call(src, "cast", args, 2, loc);
@@ -1273,10 +1149,7 @@ static yap_expr_node bp_desugar_template(yap_source* src, yap_expr_node* t, bool
                 const char* callname = argc == 0 ? "call0" : argc == 1 ? "call1" : argc == 2 ? "call2" : "call3";
                 return bp_yapi_call(src, callname, cargs, argc + 1, loc);
             }
-            // >3 args: no fixed-arity callN covers this -- fold the args into a
-            // yCallArgs list via call_args_new/call_args_push (each push returns
-            // the same list, so this chains as nested expressions) and hand it
-            // to the general yapi->call(func, args).
+            // >3 args: no fixed-arity callN covers this, so fold into a yCallArgs list (call_args_new/push chain) for the general yapi->call(func, args).
             yap_expr_node list_node = bp_yapi_call(src, "call_args_new", NULL, 0, loc);
             for_darr(idx, a, t->func_call.args){
                 yap_expr_node arg_node = bp_desugar_template(src, a.value, ok, eager);
@@ -1310,12 +1183,6 @@ static yap_expr yap_build_blueprint_expr(yap_source* src, yap_blueprint_node* bp
 
 /* ----------------------------------------------------------------
  *  Type blueprints ; the eager type${ struct/enum/union {...} } quasi-quote
- *
- *  Model A: sugar over the *construction* phase only. The body desugars into a
- *  chained yapi->struct_t()/union_t()/enum_t() + add_field/add_variant call that
- *  evaluates to a yStructT/yEnumT/yUnionT template ; you then :finish("name") it
- *  yourself (naming/hash/dedup/existed/methods all stay on the existing API).
- *  Eager: $T in a field/variant type splices the in-scope comptime yType now.
  * ---------------------------------------------------------------- */
 
 // base:method(args...) as a parse node (one link of a builder method chain).
@@ -1333,18 +1200,7 @@ static yap_expr_node bp_method_call(yap_source* src, yap_expr_node base, const c
         .loc = loc };
 }
 
-// v1 guard: a lazy ($T when eager=false) type hole may only appear as the
-// direct, unwrapped type of a var_decl -- not nested inside a pointer/slice/
-// anon-struct-or-union field. Wrapping would bake the CURRENT (unfilled) hole
-// type_id into a brand-new aggregate type_id right now, at construction time;
-// there's no "rebuild the wrapper once the hole is later filled" pass (real
-// but separable follow-on work), so allowing it today would silently produce
-// a wrapper that points at the stale unfilled hole forever, even after a
-// later :fill_type() call. Only checks the immediate child -- deeper nesting
-// (a pointer to a pointer to a hole, a struct field of pointer-to-hole type,
-// etc.) is still caught because each wrapping level makes its own recursive
-// bp_type_to_yexpr call, which re-runs this same check on its own immediate
-// child.
+// A lazy ($T, eager=false) type hole may only be the direct type of a var_decl, never nested in a pointer/slice/anon field: wrapping would bake the unfilled hole's type_id into a new aggregate type_id at construction time, and there's no pass to rebuild that wrapper once :fill_type() later closes the hole. Deeper nesting is still caught since each wrapping level re-runs this check via its own recursive bp_type_to_yexpr call.
 static bool bp_reject_wrapped_lazy_hole(yap_source* src, yap_type_node* subtype, bool eager, yap_loc loc){
     if (eager || !subtype || subtype->kind != yap_type_node_blueprint_hole) return false;
     yap_build_push_error(src, loc,
@@ -1352,14 +1208,7 @@ static bool bp_reject_wrapped_lazy_hole(yap_source* src, yap_type_node* subtype,
     return true;
 }
 
-// Chained yapi->struct_t()/union_t()/enum_t() + add_field/add_variant call for
-// an anonymous struct/union/enum body (no trailing :finish() -- the top-level
-// type${ } caller appends its own; nested anon field types (bp_type_to_yexpr)
-// append a compiler-generated :finish() name instead, same as normal
-// (non-blueprint) anonymous nested types do via ctx->anon_id). `eager`: see
-// bp_type_to_yexpr below -- type${ }'s own top-level call always passes true
-// (unchanged); a recursive call from bp_type_to_yexpr's anon-nested case
-// forwards whatever eagerness it itself received.
+// Builds the struct_t/union_t/enum_t + add_field/add_variant chain, without a trailing :finish() -- the top-level type${} caller appends its own name; a nested anon field type (bp_type_to_yexpr) appends a compiler-generated one instead.
 static yap_expr_node bp_build_type_body_chain(yap_source* src, yap_type_node* body, bool* ok, bool eager){
     yap_ctx* ctx = src->ctx;
     yap_loc loc = body->loc;
@@ -1404,24 +1253,7 @@ static yap_expr_node bp_build_type_body_chain(yap_source* src, yap_type_node* bo
     return chain;
 }
 
-// Recursively desugar a field/variant type node into the yExpr that yields its
-// yType at comptime. $T (hole): eager -> bare splice of the in-scope comptime
-// yType (type${}/fn$, unchanged); lazy -> yapi->type_hole(c"T") (stmt${ }'s new
-// var_decl path, and casts reached from a lazy expr${ }/stmt${ } template).
-// A named type -> yapi->type(c"name"); pointer/slice -> yapi->ptr_of/slice_of
-// wrapping the recursively-resolved element type (rejecting a lazy hole
-// directly underneath, see bp_reject_wrapped_lazy_hole); an anon nested
-// struct/union/enum -> the same struct_t/union_t/enum_t chain as a top-level
-// type${ } body, closed with a compiler-generated :finish() name. Deliberately
-// NOT yap_ctx_get_anon_name's "__anon_*" convention: that name is a marker
-// normal (non-blueprint) anonymous nested types rely on to mean "embed inline
-// at the use site, never emit a standalone declaration" (yap_gen_type_decl
-// skips any type whose name starts with "__" as C-reserved) -- Model A's
-// blueprint types are always independently finish()ed/nameable/dedup'd, the
-// opposite of that, so a "__"-prefixed name here would silently vanish from
-// codegen while still being referenced by field type, producing an
-// undeclared-type compile error. Const/array/function/macro field types
-// remain an extension point (clear error).
+// Deliberately does NOT use yap_ctx_get_anon_name's "__anon_*" convention for the nested anon struct/union/enum case: yap_gen_type_decl skips "__"-prefixed types as embed-inline-only, but blueprint types are always independently finish()ed/nameable, so that name would silently vanish from codegen while still referenced.
 static yap_expr_node bp_type_to_yexpr(yap_source* src, yap_type_node* t, bool* ok, bool eager){
     yap_ctx* ctx = src->ctx;
     yap_loc loc = t ? t->loc : (yap_loc){0};
@@ -1486,18 +1318,10 @@ static yap_expr yap_build_type_blueprint(yap_source* src, yap_type_blueprint_nod
 
 /* ----------------------------------------------------------------
  *  Statement blueprints ; the lazy stmt${ ...stmts... } quasi-quote
- *
- *  Each statement desugars to a yapi->expr_stmt/return_stmt/if_stmt/... builder
- *  call (exprs go through bp_desugar_template, so $holes become yapi->hole).
- *  A sequence >1 is wrapped in yapi->block(stmt_list). The result is stamped
- *  yStmtBlueprint; :fill_expr(...)/:finish() (build_state.c) clone + close it.
  * ---------------------------------------------------------------- */
 static yap_expr_node bp_desugar_stmt(yap_source* src, yap_statement_node* s, bool* ok, bool eager); // fwd
 
-// $name in identifier position (currently: a var_decl's name). Same eager/lazy
-// split as $T (bp_type_to_yexpr) and bare $body (bp_desugar_stmt's expr-hole
-// case): eager -> bare var-ref splice of an in-scope comptime yIdent value;
-// lazy -> yapi->ident_hole(c"name"), a real hole closed later via :fill_ident().
+// $name in identifier position (currently: a var_decl's name). Same eager/lazy split as $T/bare $body: eager splices an in-scope comptime yIdent, lazy makes a real hole closed later via :fill_ident().
 static yap_expr_node bp_ident_hole_or_splice(yap_source* src, char* name, bool eager, yap_loc loc){
     if (eager)
         return (yap_expr_node){ .kind = yap_expr_var,
@@ -1506,12 +1330,7 @@ static yap_expr_node bp_ident_hole_or_splice(yap_source* src, char* name, bool e
     return bp_yapi_call(src, "ident_hole", &arg, 1, loc);
 }
 
-// Combine already-desugared "build a yStmt" expr nodes into one via
-// yapi->stmt_list_new()+push...+block(...) -- the same shape bp_desugar_stmt_seq
-// below uses for a multi-statement template body, but starting from nodes
-// that are already built (used by the var_decl case in bp_desugar_stmt, which
-// always desugars to exactly two statements: the declaration, then a second
-// statement assigning the initializer).
+// Combines already-desugared "build a yStmt" expr nodes via stmt_list_new+push+block; used by var_decl's desugar-to-declare-then-assign in bp_desugar_stmt.
 static yap_expr_node bp_wrap_stmts_in_block(yap_source* src, yap_expr_node* stmts, int n, yap_loc loc){
     yap_expr_node list = bp_yapi_call(src, "stmt_list_new", NULL, 0, loc);
     for (int i = 0; i < n; i++){
@@ -1538,10 +1357,7 @@ static yap_expr_node bp_desugar_stmt_seq(yap_source* src, darr(yap_statement_nod
     return bp_yapi_call(src, "block", &list, 1, loc);
 }
 
-// `eager`: see bp_desugar_template. A bare `$body;` statement in lazy mode is a
-// statement hole (fill_stmt); in eager mode (fn$ bodies) it's a direct splice
-// of the in-scope comptime yStmt value -- a bare var-ref used AS the "build a
-// yStmt" expression, since that value already IS one (no hole, no fill needed).
+// A bare `$body;` statement is a statement hole in lazy mode (fill_stmt); in eager mode (fn$ bodies) it splices the in-scope comptime yStmt value directly, no hole needed.
 static yap_expr_node bp_desugar_stmt(yap_source* src, yap_statement_node* s, bool* ok, bool eager){
     yap_loc loc = s->loc;
     switch (s->kind){
@@ -1594,22 +1410,7 @@ static yap_expr_node bp_desugar_stmt(yap_source* src, yap_statement_node* s, boo
             }
             char* name = s->var_decl.name.value;
 
-            // yapi->var_decl(type, name) only *declares* the var (no init
-            // param), so an initializer needs a second statement assigning
-            // into it. Type and name both follow the ambient `eager` (same
-            // split $T/$body already use): eager (fn$ bodies) -> bare splice
-            // of an in-scope comptime value -- e.g. a $varname parameter of
-            // the enclosing macro function, mirroring exactly how $bonus
-            // already splices an outer yExpr into an fn$ body; lazy (stmt${ }/
-            // expr${ }) -> a real hole (yapi->type_hole/ident_hole) closed
-            // later via :fill_type()/:fill_ident(). Each of the two yapi calls
-            // that need the type/name (var_decl below, and new_var if there's
-            // an init) re-desugars them rather than reusing one shared parse
-            // node in two places -- safe and correct because both
-            // re-*construct* the same value: eager re-splices the same
-            // in-scope var-ref, lazy re-constructs the same hole (type_hole
-            // dedupes by name at intern time, see ct_make_type_hole; ident_hole
-            // just produces the same "$name" string both times).
+            // yapi->var_decl(type, name) only declares the var, so an initializer needs a second statement assigning into it. The type/name nodes are re-desugared separately for each of the two yapi calls rather than sharing one parse node -- safe because both reconstruct the same value (eager re-splices the same var-ref; lazy rebuilds the same hole, which dedupes by name).
             yap_expr_node decl_ty = bp_type_to_yexpr(src, s->var_decl.type_node, ok, eager);
             yap_expr_node decl_nm = bp_ident_hole_or_splice(src, name, eager, loc);
             yap_expr_node decl_args[2] = { decl_ty, decl_nm };
@@ -1650,19 +1451,9 @@ static yap_expr yap_build_stmt_blueprint(yap_source* src, yap_stmt_blueprint_nod
 
 /* ----------------------------------------------------------------
  *  Function blueprints ; the eager (RET fn$ params){body} quasi-quote
- *
- *  Model A: sugar over the yFnT construction phase, yielding a yFnT template you
- *  :finish("name") yourself. fn_t()/add_param/set_return_type/set_body aren't
- *  chainable (add_param returns a param yExpr), so we desugar to a block-expr:
- *    ({ _ __fnt = yapi->fn_t(); __fnt:set_return_type(R); __fnt:add_param(...);
- *       __fnt:set_body(<body block>); __fnt })
- *  whose value (the trailing __fnt ref) is the yFnT. $T in a param/return type
- *  eagerly splices the in-scope comptime yType (via bp_type_to_yexpr).
  * ---------------------------------------------------------------- */
 
-// Always wrap a statement sequence in yapi->block(stmt_list) ; a fn body is a
-// block. Always eager (true): fn$ bodies have no fill methods, so any $hole
-// here must splice immediately, not defer to a fill that could never come.
+// Always eager (true): fn$ bodies have no fill methods, so any $hole here must splice immediately, not defer to a fill that could never come.
 static yap_expr_node bp_desugar_block(yap_source* src, darr(yap_statement_node) body, yap_loc loc, bool* ok){
     yap_expr_node list = bp_yapi_call(src, "stmt_list_new", NULL, 0, loc);
     for_darr(idx, st, body){
@@ -1775,14 +1566,7 @@ yap_expr yap_build_expr(yap_source* src, yap_expr_node* node){
     return ret;
 }
 
-/* Function literal: desugar to a hoisted, static, top-level C function --
- * same shape as ct_func_finish (yap-c/build_state.c), but triggered from
- * ordinary expression building instead of a comptime yapi call. The literal
- * is capture-free by design: its body scope is parented to the *global*
- * scope, not the enclosing function's, so referencing an enclosing local is
- * an "Undefined variable" error at yap level rather than broken C output.
- * The expression's value is just a var reference to the hoisted name (C
- * auto-decays a function name to its pointer). */
+/* Function literal: desugars to a hoisted, static, top-level C function. Capture-free by design: body scope is parented to the global scope, not the enclosing function's, so referencing an enclosing local is an "Undefined variable" error rather than broken C output. */
 static yap_expr yap_build_func_literal_expr(yap_source* src, yap_func_literal_node* fnode){
     yap_ctx* ctx = src->ctx;
 
@@ -1837,9 +1621,7 @@ static yap_expr yap_build_func_literal_expr(yap_source* src, yap_func_literal_no
             .body    = body
         },
         .loc = fnode->loc,
-        // Explicit, not left to fall back to ctx->current_module->prefix --
-        // the emitted name is already unique and the call site references it
-        // unprefixed (see ct_func_finish for the same reasoning).
+        // Explicit "" rather than the module prefix: the emitted name is already unique and referenced unprefixed at call sites.
         .module_prefix = "",
     };
     if (ctx->gen_decl)
@@ -1955,11 +1737,7 @@ yap_expr yap_build_var_access_expr(yap_source* src, yap_identifier_node* ident){
     };
 }
 
-// Shared desugar target for '??' (coalesce_op) and '?=' (assignment):
-// builds the ternary 'left ? left : right' - yields 'left' if it's
-// truthy/non-zero, else 'right'. 'left' is duplicated as both the condition
-// and the true-branch value, so codegen evaluates it twice if it has side
-// effects (matches the operators' spec literally).
+// Shared desugar target for '??'/'?=' : ternary 'left ? left : right'. 'left' is duplicated as condition and true-branch, so codegen evaluates it twice if it has side effects (matches spec).
 static yap_expr yap_build_coalesce_ternary(yap_source* src, yap_loc loc, yap_expr left, yap_expr right){
     yap_ctx* ctx = src->ctx;
 
@@ -1993,9 +1771,7 @@ yap_expr yap_build_bin_expr(yap_source* src, yap_bin_op_node* bin){
     if (left.kind == yap_expr_error || right.kind == yap_expr_error)
         return (yap_expr){ .kind = yap_expr_error };
 
-    // '??' (coalesce_op) never becomes a yap_bin_expr - it's pure sugar for
-    // a ternary, built and returned directly here instead of falling through
-    // to the generic binary-operator allow-list/common-type logic below.
+    // '??' never becomes a yap_bin_expr: pure sugar for a ternary, returned directly instead of falling through to the generic binary-op logic below.
     if (bin->op == 'c')
         return yap_build_coalesce_ternary(src, bin->loc, left, right);
 
@@ -2044,11 +1820,7 @@ yap_expr yap_build_unary_expr(yap_source* src, yap_unary_op_node* un){
     yap_type_id result_type = expr.type;
 
     if (un->op == '!'){
-        // Logical not: truthy-checks any scalar (primitive or pointer), same
-        // as C's own '!' and matching this language's existing truthy-check
-        // operators ('??'/'?=', see yap_build_coalesce_ternary, and if/while
-        // conditions) which never restrict to bool either -- codegen defers
-        // to C's native truthiness. Result is always bool.
+        // Truthy-checks any scalar (primitive or pointer), same as C's own '!'; codegen defers to C's native truthiness. Result is always bool.
         bool is_scalar = operand_type
             && (operand_type->kind == yap_type_primitive || operand_type->kind == yap_type_ptr);
         if (!is_scalar){
@@ -2057,10 +1829,7 @@ yap_expr yap_build_unary_expr(yap_source* src, yap_unary_op_node* un){
         }
         result_type = ctx->bool_type_id;
     } else {
-        // '-' (negation) and '~' (bitwise not) both require a non-bool
-        // numeric operand; result keeps the operand's own type, same as '-'
-        // always did (mirrors the existing bitwise binary ops, which also
-        // don't distinguish int from float beyond this).
+        // '-' and '~' both require a non-bool numeric operand; result keeps the operand's own type.
         bool is_numeric = operand_type && operand_type->kind == yap_type_primitive
             && !yap_ctx_type_ids_eq(ctx, coerced, ctx->bool_type_id);
         if (!is_numeric){
@@ -2138,13 +1907,7 @@ yap_expr yap_build_assignment_expr(yap_source* src, yap_assignment_node* assign)
     };
 }
 
-/* Struct/union/enum name, or (for builtin opaque comptime types like yType,
- * yStructT, yFnT, ... which have no nominal struct/union/enum name but can
- * still have builtin methods registered under "PrimitiveName_methodname",
- * see ctx.c) the primitive's own declared name. Harmless for every other
- * primitive since none has methods. Shared by real method dispatch
- * (yap_build_method_callee) and receiver-dispatched macro calls
- * (yap_exec_macro_call), both of which mangle "OwnerName_name" the same way. */
+/* Struct/union/enum name, or (for opaque comptime types like yType/yStructT/yFnT, which have builtin methods but no nominal name) the primitive's own declared name. Shared by method dispatch and receiver-dispatched macro calls, both mangling "OwnerName_name" the same way. */
 static const char* yap_owner_name_for_type(yap_ctx* ctx, yap_type_id type_id){
     yap_type* t = yap_ctx_get_type(ctx, type_id);
     if (!t) return NULL;
@@ -2194,22 +1957,12 @@ static yap_expr yap_build_method_callee(yap_source* src, yap_method_access_node*
     };
 }
 
-/* Looks up the top-level declaration a call targets (a plain function name,
- * or the mangled "TypeName_method" name a method call resolves to), so
- * default values and parameter names can be read off it. Returns NULL for
- * anything called indirectly through a function-typed variable/expression,
- * since there's no declaration to resolve names/defaults against there. */
+/* Looks up the top-level declaration a call targets, so default values/parameter names can be read off it. Returns NULL for indirect calls through a function-typed variable/expression. */
 static yap_func_decl* yap_find_func_decl_for_call(yap_source* src, yap_expr func_expr){
     yap_ctx* ctx = src->ctx;
     if (func_expr.kind != yap_expr_var || !func_expr.var_name) return NULL;
 
-    /* A call from inside the module's own source resolves the callee through
-     * ordinary scope lookup, which gives back its bare, unprefixed registered
-     * name (Pass 1 only mangles methods, never plain module functions) -- so
-     * a declaration's own module_prefix alone can't tell us whether the
-     * CALLER's var_name needs the prefix stripped or not. Track which module
-     * (if any) src itself belongs to, so a bare name is only matched against
-     * that module's declarations, not any module in the flat decl list. */
+    /* A bare in-module call resolves to its unprefixed name (Pass 1 only mangles methods, not plain functions), so the declaration's module_prefix alone can't say whether the caller's var_name needs stripping; track src's own module so a bare name only matches that module's declarations. */
     const char* current_module_prefix = NULL;
     {
         yap_module* owning_mod = yap_source_owning_module(ctx, src);
@@ -2261,21 +2014,14 @@ yap_expr yap_build_func_call_expr(yap_source* src, yap_func_call_node* call){
     darr(yap_type_id) expected_args = func_type->func.args;
     unsigned int nexpected = darr_len(expected_args);
 
-    /* Each declared parameter fills exactly one slot: positional args claim
-     * the next unclaimed slot in order, named args ('.name = value') claim
-     * their slot by name wherever it falls, and either kind can leave gaps
-     * for later args (positional or default) to fill -- same scheme
-     * yap_build_blob_cast already uses for struct-literal fields. */
+    /* Positional args claim the next unclaimed slot in order; named args ('.name = value') claim their slot by name; either can leave gaps for later args/defaults to fill (same scheme as yap_build_blob_cast's struct-literal fields). */
     bool*     used  = yap_ctx_malloc(ctx, sizeof(bool) * (nexpected ? nexpected : 1));
     yap_expr* slots = yap_ctx_malloc(ctx, sizeof(yap_expr) * (nexpected ? nexpected : 1));
     for (unsigned int i = 0; i < nexpected; i++) used[i] = false;
 
     if (is_method_call && nexpected > 0){
         if (!yap_ctx_type_id_compatible(ctx, receiver.type, expected_args[0])){
-            /* Pointer-receiver method (subject type is 'T@'): auto-take-address of an
-             * lvalue receiver of type 'T', same as Go/C++ implicit &this binding, so
-             * mutating methods (e.g. a growable array's push()) can write back to the
-             * caller's variable without the caller writing '&a:push(x)' by hand. */
+            /* Pointer-receiver method (subject type 'T@'): auto-address-of an lvalue receiver of type 'T', so mutating methods (e.g. push()) can write back without the caller writing '&a:push(x)' by hand. */
             yap_type* expected_t = yap_ctx_get_type(ctx, expected_args[0]);
             yap_type* receiver_t = yap_ctx_get_type(ctx, receiver.type);
             yap_type* pointee_t  = (expected_t && expected_t->kind == yap_type_ptr)
@@ -2526,9 +2272,7 @@ static yap_expr yap_build_blob_cast(yap_source* src, yap_expr blob_expr, yap_typ
     return (yap_expr){ .kind = yap_expr_error };
 }
 
-// C only allows a cast's operand and target to be scalar (or void) -- structs,
-// unions, arrays and slices are never cast targets there, only reinterpreted
-// through a pointer. Enums count as integers, function values as pointers.
+// Mirrors C's cast rules: only scalars (or void) are valid cast targets, never structs/unions/arrays/slices. Enums count as integers, function values as pointers.
 typedef enum { yap_cast_cat_int, yap_cast_cat_float, yap_cast_cat_ptr, yap_cast_cat_aggregate } yap_cast_category;
 
 static bool yap_cast_type_category(yap_ctx* ctx, yap_type_id id, yap_cast_category* out){
@@ -2557,11 +2301,7 @@ static bool yap_cast_type_category(yap_ctx* ctx, yap_type_id id, yap_cast_catego
     }
 }
 
-// Follows C's cast rules: any scalar (integer/enum, float, pointer/function)
-// casts freely to any other scalar, except float<->pointer, which C never
-// defines a conversion for. Aggregates can't be cast at all, matching C where
-// a cast's operand and target must both be scalar; casting to bare 'none' is
-// always allowed, mirroring C's universal "(void)expr" idiom.
+// Any scalar casts freely to any other scalar except float<->pointer (C defines no conversion there); casting to 'none' is always allowed, mirroring C's "(void)expr".
 static bool yap_check_cast_compatible(yap_source* src, yap_loc loc, yap_type_id expr_type_id, yap_type_id target_type_id){
     yap_ctx* ctx = src->ctx;
     if (target_type_id == ctx->void_type_id) return true;
@@ -2733,15 +2473,7 @@ yap_expr yap_build_member_access_expr(yap_source* src, yap_member_access_node* m
 
     yap_type* obj_type = yap_ctx_get_type(ctx, object.type);
 
-    /* Auto-deref: 'ptr.field' transparently dereferences a pointer to a
-     * struct/union before accessing the member, same as Go (and unlike C,
-     * which needs a separate '->'; this language's '->' is already taken
-     * for module access, e.g. 'io->print'). Synthesize the same deref_expr
-     * yap_build_deref_expr itself would build, then keep going as if
-     * 'object' had been the dereferenced struct/union all along -- 'ptr..field'
-     * (an explicit deref chained into a member access) still works too,
-     * since by the time it reaches here 'object' is already struct-typed
-     * and this branch simply doesn't trigger. */
+    /* Auto-deref: 'ptr.field' transparently dereferences a pointer to struct/union before accessing the member, since '->' is already taken for module access here. An explicit 'ptr..field' still works too: by the time it reaches here 'object' is already struct-typed and this branch doesn't trigger. */
     if (obj_type && obj_type->kind == yap_type_ptr){
         yap_type* pointee_type = yap_ctx_get_type(ctx, obj_type->pointer_type);
         if (pointee_type && (pointee_type->kind == yap_type_struct || pointee_type->kind == yap_type_union)){
@@ -2756,11 +2488,7 @@ yap_expr yap_build_member_access_expr(yap_source* src, yap_member_access_node* m
         }
     }
 
-    /* Slices (e.g. string literals, yExprList) codegen to a real
-     * 'struct { T* data; unsigned long len; }' (yap_gen_name_type_combo's
-     * yap_type_slice case) -- expose those two fields directly rather than
-     * requiring a builder/method for something that's already a plain
-     * struct at the C level. */
+    /* Slices codegen to a real 'struct { T* data; unsigned long len; }', so expose those two fields directly rather than requiring a builder/method. */
     if (obj_type && obj_type->kind == yap_type_slice){
         if (ma->member.value && strcmp(ma->member.value, "len") == 0){
             yap_type_id u64_id = yap_ctx_get_type_id_by_name(ctx, "u64");
@@ -2811,11 +2539,7 @@ yap_expr yap_build_member_access_expr(yap_source* src, yap_member_access_node* m
     };
 }
 
-// `ptr?.member`: only valid on a pointer to struct/union. When `ptr` is
-// null at runtime, evaluates to the zero value of `member`'s type instead
-// of dereferencing (there's no Optional<T> in yap to propagate, so a zero
-// value is the fallback - chosen so the result keeps the same type as plain
-// `.member` access, letting `?.` chains keep type-checking normally).
+// `ptr?.member`: when `ptr` is null at runtime, evaluates to the zero value of `member`'s type instead of dereferencing (no Optional<T> to propagate), so the result keeps the same type as plain `.member` and `?.` chains still type-check normally.
 yap_expr yap_build_optional_member_access_expr(yap_source* src, yap_member_access_node* ma){
     yap_ctx* ctx = src->ctx;
 
@@ -2853,9 +2577,7 @@ yap_expr yap_build_optional_member_access_expr(yap_source* src, yap_member_acces
     };
 }
 
-// `expr.`: unchecked dereference, works on any pointer type. Unlike `?.`,
-// this is the raw/unsafe deref (matching C's *ptr - UB on null), since `?.`
-// already exists as the null-checked alternative for struct field access.
+// `expr.`: raw/unsafe deref (matches C's *ptr, UB on null); `?.` is the null-checked alternative for struct field access.
 yap_expr yap_build_deref_expr(yap_source* src, yap_deref_node* dn){
     yap_ctx* ctx = src->ctx;
 
@@ -2998,34 +2720,10 @@ static bool yap_is_comptime_type(yap_ctx* ctx, yap_type_id id){
         || id == ctx->void_type_id;
 }
 
-/* Matches yap_gen_name_type_combo's yap_type_slice codegen exactly
- * ('struct { T* data; unsigned long len; }') -- the runtime shape a real
- * yap-level slice value has once compiled. Macro-call args are marshalled to
- * TCC through a uniform void*-per-slot dispatch (see the switch at the
- * bottom of this function), which can only ever pass one pointer-sized
- * value per slot -- a genuine 2-word by-value slice can't cross that
- * boundary directly, so blob-literal ([a,b,c]) args build one of these on
- * the arena and pass its *address*, and the callee's declared param type
- * must be a pointer to the slice (e.g. 'yExprList@'), not the slice itself. */
+/* Matches the compiled slice's runtime shape ('struct { T* data; unsigned long len; }'). Macro-call args marshal to TCC one void* pointer-sized value per slot, so a 2-word by-value slice can't cross directly: blob-literal args build one of these on the arena and pass its address, with the callee's declared param type a pointer to the slice, not the slice itself. */
 typedef struct { void* data; unsigned long len; } yap_yexpr_slice;
 
-/* Resolves a macro-call argument written in a yType-expecting slot, e.g.
- * `pair:(i32, i32)` or `hashmap:(byte@, V)`, when the argument parsed as an
- * ordinary expression (macro_param's unnamed_param, `$._expr` -- there's no
- * separate "type expression" alternative for these shapes since bare
- * identifiers/pointer-of/parens/nested-macro-calls are already valid
- * expressions). `byte@` arrives as an at_op node (the same postfix '@' used
- * for address-of elsewhere) wrapping a var node for "byte", not as any kind
- * of type node. A bare identifier (`i32`) is the base case; an at_op wraps
- * one more level of pointer-of around whatever its inner expr resolves to,
- * so `byte@@` (recursing twice) works the same way. A paren_expr (`(i32)`)
- * just unwraps to its inner expr. A nested macro call (`outer:(inner:(i32))`)
- * is actually executed via yap_build_macro_type -- same entrypoint used when
- * a macro call appears in real type position -- and its returned yType is
- * taken directly. Returns 0 (unresolved) for anything else. Array/slice/
- * function/const-type spellings (`i32[4]`, `(i32 fn i32)`, `i32 const`) parse
- * as a distinct yap_macro_param_type (they have no _expr equivalent) and are
- * resolved via yap_build_type_from_type_node instead -- see the caller. */
+/* Resolves a macro-call argument written in a yType-expecting slot (e.g. `pair:(i32, i32)`) when it parsed as an ordinary expression, since compound-type spellings like `byte@` have no dedicated "type expression" grammar and arrive as at_op/paren/nested-macro-call nodes instead. Array/slice/function/const-type spellings parse as a distinct yap_macro_param_type and go through yap_build_type_from_type_node instead (see caller). */
 static yap_type_id yap_resolve_macro_type_arg(yap_source* src, yap_expr_node* expr){
     yap_ctx* ctx = src->ctx;
     if (!expr) return 0;
@@ -3054,20 +2752,7 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
         return NULL;
     }
 
-    /* Receiver-dispatched macro call: 'recv:name:(args)' parses 'recv:name'
-     * as a method_access caller (macro_caller already allows this in the
-     * grammar). A macro-method association is never inferred from the
-     * receiver's type/mangled name -- it's looked up directly in
-     * ctx->macro_methods, a table populated only by explicit
-     * yapi->register_macro_method(owner, name, backing_fn) calls (e.g. one
-     * arr(T) instantiation registering "for" for its own concrete `res`,
-     * right where it's built). That table lives entirely separately from
-     * where real per-instantiation methods (global_scope, mangled
-     * "OwnerName_name") and ordinary bare-name macros (their own module's
-     * scope) live, so a macro method and a same-named real method can never
-     * collide even in principle -- no shape-based guessing needed. The
-     * receiver becomes an implicit first argument (an AST-node value,
-     * exactly like a '#expr' param), ahead of whatever the call site wrote. */
+    /* Receiver-dispatched macro call: 'recv:name:(args)'. The macro-method association is never inferred from the receiver's type/name -- it's looked up in ctx->macro_methods, populated only by explicit yapi->register_macro_method(owner, name, fn) calls, a table entirely separate from where real methods and ordinary macros live, so a macro method can never collide with a same-named real one. The receiver becomes an implicit first argument, like a '#expr' param. */
     yap_expr receiver = {0};
     bool has_receiver = false;
     yap_expr caller;
@@ -3131,10 +2816,7 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
     }
     unsigned int provided_count = darr_len(call->params) + receiver_offset;
 
-    /* A trailing yExprList param may be omitted entirely at the call site
-     * (e.g. `print:(c"hi")` instead of `print:(c"hi", [])`) ; it then
-     * defaults to an empty list, so arg_ptrs must have room for it even
-     * when provided_count is one short. */
+    /* A trailing yExprList param may be omitted at the call site and defaults to an empty list, so arg_ptrs must have room for it even when provided_count is one short. */
     unsigned int alloc_count = (provided_count > expected_count) ? provided_count : expected_count;
     void** arg_ptrs = NULL;
     if (alloc_count > 0)
@@ -3181,18 +2863,7 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
                 } else if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_bool){
                     arg_ptrs[slot] = (void*)(uintptr_t)(strus_eq(built.literal.text, "true") ? 1 : 0);
                 } else if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_blob){
-                    /* A blob literal `[a, b, c]` is built (yap_build_blob below in
-                     * the literal-build path) as a darr(yap_expr) of already
-                     * type-checked elements ; a contiguous array of *structs*.
-                     * A yExpr value is an 8-byte opaque handle (a pointer to one
-                     * such struct, per its "void*" c_name), so the slice's data
-                     * array must hold one pointer per element, not the structs
-                     * themselves ; build that indirection here. Built as the real
-                     * slice ABI shape (see yap_yexpr_slice) and passed by
-                     * address, since the generic void*-per-slot dispatch below
-                     * can't carry a 2-word by-value struct directly ; the
-                     * callee's declared param type must be 'yExprList@', not
-                     * bare 'yExprList'. */
+                    /* A yExpr value is an 8-byte opaque handle (pointer to a struct), but the blob builds a contiguous array of the structs themselves, so the slice's data array needs one pointer per element -- build that indirection here, passed by address since void*-per-slot can't carry a 2-word struct directly (callee param type must be 'yExprList@', not bare 'yExprList'). */
                     unsigned int blob_count = built.literal.blob.field_count;
                     yap_expr** elem_ptrs = blob_count
                         ? (yap_expr**)yap_ctx_one_raw(ctx, sizeof(yap_expr*) * blob_count)
@@ -3250,16 +2921,7 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
                 break;
             }
             case yap_macro_param_statement: {
-                /* A raw statement/block macro arg (e.g. the '{ }' body of
-                 * `a:for:(+i, +v, { ... });`) can't be built now -- it may
-                 * reference hygienic idents (+i/+v) the macro itself hasn't
-                 * introduced yet (that only happens once the macro's
-                 * returned yStmt is spliced back in, see
-                 * yap_resolve_deferred_fragments below). Pass it through as
-                 * an opaque yStmt sentinel carrying the unbuilt parse node;
-                 * the macro can embed it anywhere in its own returned tree
-                 * (e.g. via a stmt${ }'s :fill_stmt()) with no special
-                 * awareness needed. */
+                /* A raw statement/block macro arg can't be built now -- it may reference hygienic idents the macro hasn't introduced yet (only true once its returned yStmt is spliced back in, see yap_resolve_deferred_fragments). Passed through as an opaque sentinel carrying the unbuilt parse node. */
                 yap_statement* deferred = yap_ctx_one(ctx, yap_statement);
                 *deferred = (yap_statement){
                     .kind = yap_statement_deferred,
@@ -3676,16 +3338,7 @@ yap_block yap_build_block(yap_source* src, yap_block_node* bnode){
     yap_ctx* ctx = src->ctx;
 
     uint32_t count = darr_len(bnode->statements);
-    /* Built into a plain (malloc-backed, growable) darr first, NOT the usual
-     * yap_ctx_darr_new/arena-backed one: a macro-call statement can flatten
-     * into MORE entries than `count` (see below), and darr_push's growth path
-     * (_darr_grow_if_needed -> darr_resize -> realloc) is only safe for a
-     * standalone malloc'd block -- an arena-backed darr's storage is a slice
-     * of a much larger quake_alloc chunk, so pushing past its initial .cap
-     * silently corrupts adjacent arena memory instead of growing (confirmed
-     * via a real heap-corruption crash while building this). The final,
-     * correctly-sized copy below is what actually becomes yap_block.statements
-     * (arena-owned, matching every other use of this struct). */
+    /* Plain malloc-backed darr, NOT the usual arena-backed yap_ctx_darr_new: a macro-call statement can flatten into MORE entries than `count`, and darr_push's realloc growth path silently corrupts adjacent memory on an arena-backed darr (confirmed via a real heap-corruption crash). Copied into an arena-owned darr below once the final size is known. */
     darr(yap_statement) building = darr_new(yap_statement, .cap = count, .len = 0);
 
     yap_ctx_push_new_scope(ctx);
@@ -3693,27 +3346,11 @@ yap_block yap_build_block(yap_source* src, yap_block_node* bnode){
     for_darr(i, stmt_node, bnode->statements){
         yap_statement st = yap_build_statement(src, &stmt_node);
         if (st.kind == yap_statement_error){
-            //Commented out because all statement errors are already reported in yap_build_statement
-            //yap_build_push_error(src, stmt_node.loc, "Invalid statement in block");
             yap_ctx_pop_scope(ctx);
             darr_free(building);
             return (yap_block){ .kind = yap_block_error };
         }
-        /* A bare macro-call statement (e.g. `declare_var:(...);`) that
-         * expanded to a yStmt block (a var_decl needing a second statement
-         * for its initializer -- see bp_wrap_stmts_in_block, stmt${ }'s
-         * var_decl support) must NOT be nested as a literal C block: codegen
-         * (yap_gen_block) emits a real '{ ... }' scope for any
-         * yap_statement_block, which would make a var_decl introduced inside
-         * it invisible the instant that block closes -- defeating the entire
-         * point of a macro-introduced variable (a BARE var_decl macro like
-         * declare_int already works correctly because its result, with no
-         * wrapping block, splices directly into the caller's own statement
-         * list with no extra scope). Flatten: splice the block's top-level
-         * statements directly into THIS block's list instead of nesting them.
-         * A literal source-level '{ }' the user actually wrote is unaffected
-         * -- that parses as yap_statement_block, not yap_statement_expr
-         * wrapping a yap_expr_macro, so it never reaches this branch. */
+        /* A macro-call statement that expanded to a yStmt block (e.g. a var_decl needing a second statement for its initializer) must NOT nest as a literal C block: codegen emits a real '{ }' scope for any yap_statement_block, which would make an introduced var_decl invisible the instant that block closes. Flatten its top-level statements into this block's list instead. A user-written '{ }' is unaffected (parses as yap_statement_block, not this shape). */
         if (stmt_node.kind == yap_statement_expr && stmt_node.expr.kind == yap_expr_macro &&
             st.kind == yap_statement_block && st.block.kind == yap_block_valid){
             for_darr(j, inner, st.block.statements) darr_push(building, inner);
