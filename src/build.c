@@ -1941,16 +1941,80 @@ static yap_expr yap_build_method_callee(yap_source* src, yap_method_access_node*
     }
 
     char* mangled_name = yap_ctx_strus_newf(ctx, "%s_%s", owner_name, ma->name.value);
-    const yap_var* method_var = yap_scope_get_var_recursive(yap_ctx_current_scope(ctx), mangled_name);
+    /* Check the calling module's own scope directly (non-recursive) first: hand-written
+     * methods register into their declaring module's own scope at Pass 1 (see the fallback
+     * loop below), so a hit here really is owned by that module and needs its prefix
+     * reapplied. This must come before the recursive lookup, not after -- core yapi builder
+     * methods (yStructT_add_field, yFnT_add_param, ...) are registered directly into
+     * global_scope, an ancestor of every module's scope, so the recursive lookup below finds
+     * them too. Those aren't owned by whichever module happens to be building right now and
+     * must never get its prefix, or e.g. a macro inside the hashmap module calling the
+     * builtin yStructT_add_field mangles to 'yhm_yStructT_add_field', which nothing emits. */
+    yap_module* owning_mod = yap_source_owning_module(ctx, src);
+    yap_module* method_mod = NULL;
+    const yap_var* method_var = NULL;
+    if (owning_mod && owning_mod->scope) method_var = yap_scope_get_var(owning_mod->scope, mangled_name);
+    if (method_var){
+        method_mod = owning_mod;
+    } else {
+        /* Not the calling module's own method -- fall through to the full lexical chain
+         * (covers global-scope builtins, deliberately left unprefixed) before trying other
+         * modules below. */
+        method_var = yap_scope_get_var_recursive(yap_ctx_current_scope(ctx), mangled_name);
+    }
+    if (!method_var){
+        /* Not found in the caller's own lexical scope chain -- hand-written methods
+         * register into their declaring module's own scope at Pass 1, which is a
+         * SIBLING of an external caller's scope (both children of global_scope),
+         * never an ancestor. So a method declared in an imported module (e.g. a
+         * laydoh-style bindings module's own hand-written sugar) is otherwise
+         * invisible from any consumer that merely imports that module, unlike
+         * plain module->func() calls, which look inside the target module's scope
+         * explicitly. Method syntax has no such explicit qualifier, so fall back
+         * to searching every other registered module's scope directly for the
+         * same mangled name. Ambiguous only if two DIFFERENT modules both define
+         * it -- vanishingly unlikely, since the name is already namespaced by the
+         * receiver's own type name. */
+        yap_module* found_in_mod = NULL;
+        void* item;
+        size_t iter = 0;
+        while (hashmap_iter(ctx->modules, &iter, &item)){
+            yap_module* m = item;
+            if (!m->scope) continue;
+            const yap_var* candidate = yap_scope_get_var(m->scope, mangled_name);
+            if (!candidate) continue;
+            if (method_var && found_in_mod && m->name && found_in_mod->name
+                && strcmp(found_in_mod->name, m->name) != 0){
+                yap_build_push_error(src, ma->loc,
+                    "Method '%s' for type '%s' is ambiguous between modules '%s' and '%s'",
+                    ma->name.value, owner_name, found_in_mod->name, m->name);
+                return (yap_expr){ .kind = yap_expr_error };
+            }
+            method_var = candidate;
+            found_in_mod = m;
+        }
+        method_mod = found_in_mod;
+    }
     if (!method_var){
         yap_build_push_error(src, ma->loc, "No method '%s' found for type '%s'", ma->name.value, owner_name);
         return (yap_expr){ .kind = yap_expr_error };
     }
 
+    /* Methods mangle to "TypeName_methodname" only (see yap_func_decl_emit_name) --
+     * no module prefix baked in at Pass-1 registration, unlike the module-access
+     * path (yap_build_module_access_expr) which explicitly re-applies mod->prefix
+     * here at the use site. Do the same for methods, or a call into a prefixed
+     * module's method silently references the unprefixed symbol while the actual
+     * definition was emitted under the prefixed one. */
+    char* emit_name = method_var->name;
+    if (method_mod && method_mod->prefix && method_mod->prefix[0]){
+        emit_name = yap_ctx_strus_newf(ctx, "%s%s", method_mod->prefix, method_var->name);
+    }
+
     *out_receiver = receiver;
     return (yap_expr){
         .kind        = yap_expr_var,
-        .var_name    = method_var->name,
+        .var_name    = emit_name,
         .type        = method_var->type,
         .is_lvalue   = true,
         .is_comptime = false
@@ -2237,12 +2301,14 @@ static yap_expr yap_build_blob_cast(yap_source* src, yap_expr blob_expr, yap_typ
                 if (fields[fi].default_value){
                     darr_push(ordered, *fields[fi].default_value);
                     darr_push(ordered_names, fields[fi].name);
-                } else {
-                    yap_build_push_error(src, loc,
-                        "Missing value for field '%s' with no default",
-                        fields[fi].name ? fields[fi].name : "(unnamed)");
-                    return (yap_expr){ .kind = yap_expr_error };
                 }
+                // else: leave it out of the blob entirely. Codegen
+                // (yap_gen_blob_literal) emits this as a real C designated-
+                // initializer compound literal, and C99/C11 zero-initializes
+                // any aggregate member that has no initializer at all --
+                // matching plain '{0}'/CLAY__INIT-style C struct-literal
+                // semantics instead of forcing every field to be named or
+                // defaulted.
             }
         }
 
