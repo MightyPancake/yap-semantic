@@ -3158,6 +3158,14 @@ yap_type_id yap_build_type_from_type_node(yap_source* src, yap_type_node* tnode)
         case yap_type_node_error:
             return 0;
 
+        case yap_type_node_blueprint_hole:
+            // Holes are consumed by bp_type_to_yexpr while desugaring a blueprint body ;
+            // reaching here means '$name' was used as a type outside any blueprint.
+            yap_build_push_error(src, tnode->loc,
+                "'$%s' is a blueprint hole and can only appear inside a type${...} blueprint body",
+                tnode->identifier.value ? tnode->identifier.value : "?");
+            return 0;
+
         case yap_type_node_identifier: {
             if (!tnode->identifier.value) return 0;
             yap_type_id id = yap_ctx_get_type_id_by_name(ctx, tnode->identifier.value);
