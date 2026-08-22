@@ -1655,13 +1655,13 @@ yap_expr yap_build_literal_expr(yap_source* src, yap_literal_node* lit){
             yap_type_id byte_id = yap_ctx_get_type_id_by_name(ctx, "byte");
             yap_type slice_t = { .kind = yap_type_slice, .slice = { .element_type = byte_id }, .is_const = false };
             res.type = yap_ctx_insert_type_if_not_exists(ctx, slice_t);
-            res.literal = (yap_literal){ .kind = yap_literal_string, .text = lit->string.value };
+            res.literal = (yap_literal){ .kind = yap_literal_string, .text_len = lit->string.value_len, .text = lit->string.value };
             break;
         }
         case yap_literal_cstring: {
             yap_type_id byte_id = yap_ctx_get_type_id_by_name(ctx, "byte");
             res.type = yap_ctx_get_pointer_of_type_id(ctx, byte_id);
-            res.literal = (yap_literal){ .kind = yap_literal_cstring, .text = lit->string.value };
+            res.literal = (yap_literal){ .kind = yap_literal_cstring, .text_len = lit->string.value_len, .text = lit->string.value };
             break;
         }
         case yap_literal_bool:
