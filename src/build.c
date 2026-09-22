@@ -50,7 +50,7 @@ static const char* yap_source_display_name(yap_source* src){
     return "(unknown)";
 }
 
-/* 'chain' holds the sources currently in_progress, innermost last, so the cycle can be named as the path that closed it rather than just the file it closed on. */
+/* 'chain' is the in_progress stack, innermost last, so the cycle can be named as a path. */
 static void yap_build_report_import_cycle(yap_ctx* ctx, yap_source* src, darr(yap_source*) chain){
     size_t start = 0;
     for_darr(i, link, chain){
@@ -71,7 +71,7 @@ static void yap_build_report_import_cycle(yap_ctx* ctx, yap_source* src, darr(ya
         : (yap_error){ .kind = yap_error_no_pos, .msg = msg });
 }
 
-/* Dedup is by parsed node, not by origin: the parser caches one yap_source_node per absolute path, so every yap_source that shares a file shares its node and therefore its status. 'chain' is passed as pointer-to-darr so a realloc in a deep call stays visible to shallower frames instead of leaving them a dangling pointer. */
+/* Dedup is by node, not origin: the parser caches one node per absolute path, so sources sharing a file share a status. 'chain' is pointer-to-darr so a realloc in a deep call stays visible to shallower frames. */
 static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(yap_source*)* chain){
     if (!src || !src->source_node) return;
     yap_source_node* snode = src->source_node;
@@ -149,12 +149,9 @@ yap_ctx* yap_build(yap_ctx* ctx, yap_args args){
         return ctx;
     }
 
-    /* Every file source is reachable through the file-import spine (yap_ctx_new_file_source
-     * records one on its parent, module mod.yp files included), so seeding the walk from
-     * ctx->sources covers the same graph the root's imports did, in the same order: the
-     * post-order recursion puts each source's dependencies ahead of it regardless of where
-     * we entered. Sweeping repeatedly, rather than once, is what lets a source appended to
-     * ctx->sources mid-build still get picked up. */
+    /* Every file source hangs off the file-import spine, so seeding from ctx->sources
+     * reaches the same graph the root's imports did; the post-order recursion orders it.
+     * Sweeping repeatedly is what picks up sources appended mid-build. */
     darr(yap_source*) chain = darr_new(yap_source*);
     bool progressed = true;
     while (progressed){
