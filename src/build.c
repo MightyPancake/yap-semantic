@@ -43,30 +43,57 @@ static yap_module* yap_source_owning_module(yap_ctx* ctx, yap_source* src){
     return yap_ctx_current_module(ctx);
 }
 
-/* visited_origins is passed as pointer-to-darr so a realloc in a deep call stays visible to shallower frames instead of leaving them a dangling pointer. */
-static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(char*)* visited_origins){
-    if (!src || !src->source_node) return;
+static const char* yap_source_display_name(yap_source* src){
+    if (!src) return "(unknown)";
+    if (src->label && src->label[0]) return src->label;
+    if (src->identity && src->identity[0]) return src->identity;
+    return "(unknown)";
+}
 
-    // Skip if already visited (by origin)
-    if (src->origin){
-        for_darr(i, vo, *visited_origins){
-            if (strcmp(vo, src->origin) == 0) return;
-        }
-        darr_push(*visited_origins, src->origin);
+/* 'chain' holds the sources currently in_progress, innermost last, so the cycle can be named as the path that closed it rather than just the file it closed on. */
+static void yap_build_report_import_cycle(yap_ctx* ctx, yap_source* src, darr(yap_source*) chain){
+    size_t start = 0;
+    for_darr(i, link, chain){
+        if (link && link->source_node == src->source_node){ start = i; break; }
     }
+
+    char* path = strus_copy(yap_source_display_name(chain[start]));
+    for (size_t i = start + 1; i < darr_len(chain); i++){
+        char* next = strus_newf("%s -> %s", path, yap_source_display_name(chain[i]));
+        free(path);
+        path = next;
+    }
+    char* msg = strus_newf("Import cycle detected: %s -> %s", path, yap_source_display_name(src));
+    free(path);
+
+    yap_ctx_push_error(ctx, src->import_loc.src
+        ? (yap_error){ .kind = yap_error_pos, .src = src->import_loc.src, .range = src->import_loc.range, .msg = msg }
+        : (yap_error){ .kind = yap_error_no_pos, .msg = msg });
+}
+
+/* Dedup is by parsed node, not by origin: the parser caches one yap_source_node per absolute path, so every yap_source that shares a file shares its node and therefore its status. 'chain' is passed as pointer-to-darr so a realloc in a deep call stays visible to shallower frames instead of leaving them a dangling pointer. */
+static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(yap_source*)* chain){
+    if (!src || !src->source_node) return;
+    yap_source_node* snode = src->source_node;
+
+    if (snode->status == yap_source_built) return;
+    if (snode->status == yap_source_in_progress){
+        yap_build_report_import_cycle(ctx, src, *chain);
+        return;
+    }
+
+    snode->status = yap_source_in_progress;
+    darr_push(*chain, src);
 
     // Recurse into file-import children first (leaves before parents)
     for_darr(i, imp, src->imports){
         if (imp.kind != yap_import_file) continue;
         yap_source* child = find_source_by_identity(ctx, imp.identity);
         if (child)
-            yap_build_source_postorder(ctx, child, visited_origins);
+            yap_build_source_postorder(ctx, child, chain);
     }
 
     // Now build this source's own declarations
-    yap_source_node* snode = src->source_node;
-    if (snode->was_built) return;
-    snode->was_built = true;
     yap_log("Building source: %s (%d declarations)", src->identity, darr_len(snode->declarations));
 
     // If this source is from a module import, push the module's scope
@@ -105,6 +132,9 @@ static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(char*
         darr_pop(ctx->current_scopes);
         yap_log("Popped scope for module '%s'", src->from_module_import);
     }
+
+    darr_pop(*chain);
+    snode->status = yap_source_built;
 }
 
 yap_ctx* yap_build(yap_ctx* ctx, yap_args args){
@@ -119,28 +149,25 @@ yap_ctx* yap_build(yap_ctx* ctx, yap_args args){
         return ctx;
     }
 
-    /* Walk the source tree post-order: deepest imports first,
-     * deduplicating by origin so each source file is built once. */
-    darr(char*) visited_origins = darr_new(char*);
-    for_darr(i, imp, ctx->root_source->imports){
-        yap_source* src = NULL;
-        if (imp.kind == yap_import_file){
-            src = find_source_by_identity(ctx, imp.identity);
-        } else if (imp.kind == yap_import_module){
-            for_darr(si, s, ctx->sources){
-                if (s && s->from_module_import && strcmp(s->from_module_import, imp.module_name) == 0){
-                    src = s;
-                    break;
-                }
-            }
+    /* Every file source is reachable through the file-import spine (yap_ctx_new_file_source
+     * records one on its parent, module mod.yp files included), so seeding the walk from
+     * ctx->sources covers the same graph the root's imports did, in the same order: the
+     * post-order recursion puts each source's dependencies ahead of it regardless of where
+     * we entered. Sweeping repeatedly, rather than once, is what lets a source appended to
+     * ctx->sources mid-build still get picked up. */
+    darr(yap_source*) chain = darr_new(yap_source*);
+    bool progressed = true;
+    while (progressed){
+        progressed = false;
+        for (size_t i = 0; i < darr_len(ctx->sources); i++){
+            yap_source* src = ctx->sources[i];
+            if (!src || !src->source_node) continue;
+            if (src->source_node->status != yap_source_unvisited) continue;
+            yap_build_source_postorder(ctx, src, &chain);
+            progressed = true;
         }
-        if (!src){
-            yap_log("Failed to find source for import (kind=%d)", imp.kind);
-            continue;
-        }
-        yap_build_source_postorder(ctx, src, &visited_origins);
     }
-    darr_free(visited_origins);
+    darr_free(chain);
 
     return ctx;
 }
