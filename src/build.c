@@ -535,13 +535,32 @@ static yap_type_id yap_finish_bound_type(yap_ctx* ctx, char* name, yap_type t){
     return yap_ctx_push_named_type(ctx, cname, cname, t);
 }
 
-static yap_type_id yap_finish_named_type(yap_ctx* ctx, char* name, yap_type t){
-    yap_type_id existing_id = yap_ctx_get_type_id_by_name(ctx, name);
-    if (existing_id){
-        *yap_ctx_get_type(ctx, existing_id) = t;
-        return existing_id;
+/* A module's own type belongs to that module, so its C name carries the module prefix --
+ * which already folds in the version when a module is loaded twice. The yap-level name
+ * stays as written and is resolved through the declaring module. */
+static yap_type_id yap_finish_named_type(yap_ctx* ctx, yap_module* owner, char* name, yap_type t){
+    char* prefix = (owner && owner->prefix && owner->prefix[0]) ? owner->prefix : NULL;
+    char* cname = prefix ? yap_ctx_strus_newf(ctx, "%s%s", prefix, name) : name;
+    if (t.kind == yap_type_struct){ t.structure.name = name; t.structure.c_name = cname; }
+    else if (t.kind == yap_type_union){ t.uni.name = name; t.uni.c_name = cname; }
+    else if (t.kind == yap_type_enum){ t.enumeration.name = name; t.enumeration.c_name = cname; }
+
+    yap_type_id by_cname = yap_ctx_get_type_id_by_name(ctx, cname);
+    if (by_cname){
+        *yap_ctx_get_type(ctx, by_cname) = t;
+        return by_cname;
     }
-    return yap_ctx_push_named_type(ctx, name, name, t);
+
+    /* Declarations made in pass 1 point at the placeholder filed under the plain name. */
+    yap_type_id by_name = yap_ctx_get_type_id_by_name(ctx, name);
+    yap_type* existing = by_name ? yap_ctx_get_type(ctx, by_name) : NULL;
+    bool unfinished = existing && existing->kind == yap_type_struct && !existing->structure.fields;
+    if (unfinished){
+        *existing = t;
+        if (cname != name) yap_ctx_alias_named_type(ctx, cname, by_name);
+        return by_name;
+    }
+    return yap_ctx_push_named_type(ctx, cname, cname, t);
 }
 
 yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tnode){
@@ -561,9 +580,10 @@ yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tn
                 .c_name = name,
                 .name   = name
             };
+            yap_module* owner = yap_source_owning_module(ctx, src);
             yap_type_id id = tnode->is_bind ? yap_finish_bound_type(ctx, name, t)
-                                            : yap_finish_named_type(ctx, name, t);
-            yap_module_record_type(yap_source_owning_module(ctx, src), name, id);
+                                            : yap_finish_named_type(ctx, owner, name, t);
+            yap_module_record_type(owner, name, id);
             return (yap_decl){
                 .kind = yap_decl_named_type,
                 .named_type_decl = (yap_named_type_decl){
@@ -587,9 +607,10 @@ yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tn
                 .c_name   = name,
                 .name     = name
             };
+            yap_module* owner = yap_source_owning_module(ctx, src);
             yap_type_id id = tnode->is_bind ? yap_finish_bound_type(ctx, name, t)
-                                            : yap_finish_named_type(ctx, name, t);
-            yap_module_record_type(yap_source_owning_module(ctx, src), name, id);
+                                            : yap_finish_named_type(ctx, owner, name, t);
+            yap_module_record_type(owner, name, id);
             return (yap_decl){
                 .kind = yap_decl_named_type,
                 .named_type_decl = (yap_named_type_decl){
@@ -613,9 +634,10 @@ yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tn
                 .c_name   = name,
                 .name     = name
             };
+            yap_module* owner = yap_source_owning_module(ctx, src);
             yap_type_id id = tnode->is_bind ? yap_finish_bound_type(ctx, name, t)
-                                            : yap_finish_named_type(ctx, name, t);
-            yap_module_record_type(yap_source_owning_module(ctx, src), name, id);
+                                            : yap_finish_named_type(ctx, owner, name, t);
+            yap_module_record_type(owner, name, id);
             return (yap_decl){
                 .kind = yap_decl_named_type,
                 .named_type_decl = (yap_named_type_decl){
@@ -634,9 +656,10 @@ yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tn
                 .c_name = name,
                 .name   = name
             };
+            yap_module* owner = yap_source_owning_module(ctx, src);
             yap_type_id id = tnode->is_bind ? yap_finish_bound_type(ctx, name, t)
-                                            : yap_finish_named_type(ctx, name, t);
-            yap_module_record_type(yap_source_owning_module(ctx, src), name, id);
+                                            : yap_finish_named_type(ctx, owner, name, t);
+            yap_module_record_type(owner, name, id);
             return (yap_decl){
                 .kind = yap_decl_named_type,
                 .named_type_decl = (yap_named_type_decl){
