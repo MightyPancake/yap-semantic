@@ -2765,7 +2765,7 @@ yap_expr yap_build_module_access_expr(yap_source* src, yap_module_access_node* m
         return (yap_expr){ .kind = yap_expr_error };
     }
 
-    yap_module* mod = yap_ctx_get_module(ctx, ma->module.value);
+    yap_module* mod = yap_ctx_resolve_module(ctx, src, ma->module.value);
     if (!mod){
         yap_build_push_error(src, ma->loc, "Unknown module '%s'", ma->module.value);
         return (yap_expr){ .kind = yap_expr_error };
