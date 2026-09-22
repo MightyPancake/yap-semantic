@@ -503,28 +503,43 @@ static uint64_t yap_type_layout_hash(yap_ctx* ctx, yap_type t){
     return h;
 }
 
+/* Whether a bound name is described more than once is a property of the whole program,
+ * not of arrival order, so it is counted across every source before any name is chosen.
+ * Otherwise the first module to be built would take the plain name and the same layout
+ * would be emitted under different names depending on import order. */
+static bool yap_bind_name_is_contested(yap_ctx* ctx, const char* name){
+    unsigned seen = 0;
+    for_darr(si, src, ctx->sources){
+        if (!src || !src->source_node) continue;
+        for_darr(di, dnode, src->source_node->declarations){
+            if (dnode.kind != yap_decl_named_type) continue;
+            if (!dnode.named_type_decl.is_bind) continue;
+            const char* dname = dnode.named_type_decl.name.value;
+            if (dname && strcmp(dname, name) == 0 && ++seen > 1) return true;
+        }
+    }
+    return false;
+}
+
 static yap_type_id yap_finish_bound_type(yap_ctx* ctx, char* name, yap_type t){
-    uint64_t hash = yap_type_layout_hash(ctx, t);
+    /* A name only one module describes keeps it; a contested one is named by its layout,
+     * so the emitted name is a function of the type rather than of who got there first. */
+    if (yap_bind_name_is_contested(ctx, name)){
+        uint64_t hash = yap_type_layout_hash(ctx, t);
+        char* by_layout = yap_ctx_strus_newf(ctx, "%s__%08x", name, (unsigned)(hash & 0xffffffffu));
+        if (t.kind == yap_type_struct){ t.structure.name = by_layout; t.structure.c_name = by_layout; }
+        else if (t.kind == yap_type_union){ t.uni.name = by_layout; t.uni.c_name = by_layout; }
+
+        yap_type_id existing = yap_ctx_get_type_id_by_name(ctx, by_layout);
+        if (existing){
+            yap_log("Bound type '%s' already described identically as '%s'", name, by_layout);
+            return existing;
+        }
+        yap_log("Bound type '%s' described by several modules, emitting it as '%s'", name, by_layout);
+        return yap_ctx_push_named_type(ctx, by_layout, by_layout, t);
+    }
 
     yap_type_id existing_id = yap_ctx_get_type_id_by_name(ctx, name);
-    yap_type* existing = existing_id ? yap_ctx_get_type(ctx, existing_id) : NULL;
-    /* A pass-1 placeholder has no fields yet and is not a rival layout. */
-    bool placeholder = existing && existing->kind == yap_type_struct && !existing->structure.fields;
-
-    if (existing && !placeholder && yap_type_layout_hash(ctx, *existing) == hash){
-        yap_log("Bound type '%s' already described identically, sharing it", name);
-        return existing_id;
-    }
-    if (existing && !placeholder){
-        char* distinct = yap_ctx_strus_newf(ctx, "%s__%08x", name, (unsigned)(hash & 0xffffffffu));
-        yap_log("Bound type '%s' has a rival layout, emitting it as '%s'", name, distinct);
-        if (t.kind == yap_type_struct){ t.structure.name = distinct; t.structure.c_name = distinct; }
-        else if (t.kind == yap_type_union){ t.uni.name = distinct; t.uni.c_name = distinct; }
-        yap_type_id existing_distinct = yap_ctx_get_type_id_by_name(ctx, distinct);
-        if (existing_distinct) return existing_distinct;
-        return yap_ctx_push_named_type(ctx, distinct, distinct, t);
-    }
-
     if (existing_id){
         *yap_ctx_get_type(ctx, existing_id) = t;
         return existing_id;
