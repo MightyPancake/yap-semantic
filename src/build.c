@@ -503,48 +503,36 @@ static uint64_t yap_type_layout_hash(yap_ctx* ctx, yap_type t){
     return h;
 }
 
-/* Whether a bound name is described more than once is a property of the whole program,
- * not of arrival order, so it is counted across every source before any name is chosen.
- * Otherwise the first module to be built would take the plain name and the same layout
- * would be emitted under different names depending on import order. */
-static bool yap_bind_name_is_contested(yap_ctx* ctx, const char* name){
-    unsigned seen = 0;
-    for_darr(si, src, ctx->sources){
-        if (!src || !src->source_node) continue;
-        for_darr(di, dnode, src->source_node->declarations){
-            if (dnode.kind != yap_decl_named_type) continue;
-            if (!dnode.named_type_decl.is_bind) continue;
-            const char* dname = dnode.named_type_decl.name.value;
-            if (dname && strcmp(dname, name) == 0 && ++seen > 1) return true;
-        }
-    }
-    return false;
-}
-
 static yap_type_id yap_finish_bound_type(yap_ctx* ctx, char* name, yap_type t){
-    /* A name only one module describes keeps it; a contested one is named by its layout,
-     * so the emitted name is a function of the type rather than of who got there first. */
-    if (yap_bind_name_is_contested(ctx, name)){
-        uint64_t hash = yap_type_layout_hash(ctx, t);
-        char* by_layout = yap_ctx_strus_newf(ctx, "%s__%08x", name, (unsigned)(hash & 0xffffffffu));
-        if (t.kind == yap_type_struct){ t.structure.name = by_layout; t.structure.c_name = by_layout; }
-        else if (t.kind == yap_type_union){ t.uni.name = by_layout; t.uni.c_name = by_layout; }
+    /* A bound type's C name is always derived from its layout, so it is a function of the
+     * type rather than of build order, and two modules describing the same C struct share
+     * one type. The yap-level name stays as written. */
+    uint64_t hash = yap_type_layout_hash(ctx, t);
+    char* cname = yap_ctx_strus_newf(ctx, "%s__%08x", name, (unsigned)(hash & 0xffffffffu));
+    if (t.kind == yap_type_struct){ t.structure.name = name; t.structure.c_name = cname; }
+    else if (t.kind == yap_type_union){ t.uni.name = name; t.uni.c_name = cname; }
+    else if (t.kind == yap_type_enum){ t.enumeration.name = name; t.enumeration.c_name = cname; }
 
-        yap_type_id existing = yap_ctx_get_type_id_by_name(ctx, by_layout);
-        if (existing){
-            yap_log("Bound type '%s' already described identically as '%s'", name, by_layout);
-            return existing;
-        }
-        yap_log("Bound type '%s' described by several modules, emitting it as '%s'", name, by_layout);
-        return yap_ctx_push_named_type(ctx, by_layout, by_layout, t);
+    yap_type_id same_layout = yap_ctx_get_type_id_by_name(ctx, cname);
+    if (same_layout){
+        yap_log("Bound type '%s' already described identically", name);
+        return same_layout;
     }
 
-    yap_type_id existing_id = yap_ctx_get_type_id_by_name(ctx, name);
-    if (existing_id){
-        *yap_ctx_get_type(ctx, existing_id) = t;
-        return existing_id;
+    /* Declarations made before this point already refer to the pass-1 placeholder, so the
+     * first layout fills that in; a rival layout becomes its own type. */
+    yap_type_id by_name = yap_ctx_get_type_id_by_name(ctx, name);
+    yap_type* existing = by_name ? yap_ctx_get_type(ctx, by_name) : NULL;
+    bool unfinished = existing && existing->kind == yap_type_struct && !existing->structure.fields;
+    if (unfinished){
+        *existing = t;
+        yap_ctx_alias_named_type(ctx, cname, by_name);
+        yap_log("Bound type '%s' emitted as '%s'", name, cname);
+        return by_name;
     }
-    return yap_ctx_push_named_type(ctx, name, name, t);
+
+    yap_log("Bound type '%s' has a rival layout, emitted as '%s'", name, cname);
+    return yap_ctx_push_named_type(ctx, cname, cname, t);
 }
 
 static yap_type_id yap_finish_named_type(yap_ctx* ctx, char* name, yap_type t){
@@ -2356,8 +2344,11 @@ static yap_expr yap_build_blob_cast(yap_source* src, yap_expr blob_expr, yap_typ
     }
 
     if (target->kind == yap_type_struct){
-        if (target->structure.name){
-            yap_type_id resolved_id = yap_ctx_get_type_id_by_name(ctx, target->structure.name);
+        /* Resolved by C name, which carries the type's identity; the yap name can be
+         * shared by several types once modules describe their own. */
+        char* target_key = target->structure.c_name ? target->structure.c_name : target->structure.name;
+        if (target_key){
+            yap_type_id resolved_id = yap_ctx_get_type_id_by_name(ctx, target_key);
             if (resolved_id) {
                 yap_type* resolved = yap_ctx_get_type(ctx, resolved_id);
                 if (resolved && resolved->kind == yap_type_struct && resolved->structure.fields)
