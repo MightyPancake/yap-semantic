@@ -465,6 +465,73 @@ yap_decl yap_build_fn_declaration(yap_source* src, yap_func_decl_node* fnode){
 }
 
 /* Complete the placeholder type in place (same type id), don't replace it: pointer/struct interning dedupes by mangled name, so a fresh id here would strand every pointer type interned before completion (e.g. a self-referential 'Node@ left' field built during Pass 1). */
+static void yap_module_record_type(yap_module* mod, char* name, yap_type_id id){
+    if (!mod || !name || !id) return;
+    for_darr(i, t, mod->own_types){
+        if (strcmp(t.name, name) == 0) return;
+    }
+    darr_push(mod->own_types, ((yap_module_type){ .name = name, .id = id }));
+}
+
+static yap_type_id yap_module_lookup_type(yap_module* mod, char* name){
+    if (!mod || !name || !mod->own_types) return 0;
+    for_darr(i, t, mod->own_types){
+        if (strcmp(t.name, name) == 0) return t.id;
+    }
+    return 0;
+}
+
+/* A bound type is identified by its C name plus its layout, so two modules describing
+ * the same C struct land on one type while genuinely different layouts under one name
+ * stay distinct instead of silently overwriting each other. */
+static uint64_t yap_type_layout_hash(yap_ctx* ctx, yap_type t){
+    char* acc = strus_newf("k%d", (int)t.kind);
+    darr(yap_struct_field) fields = NULL;
+    if (t.kind == yap_type_struct) fields = t.structure.fields;
+    else if (t.kind == yap_type_union) fields = t.uni.variants;
+
+    if (fields){
+        for_darr(i, f, fields){
+            yap_type* ft = yap_ctx_get_type(ctx, f.type);
+            char* next = strus_newf("%s|%s:%d", acc, f.name ? f.name : "", ft ? (int)ft->kind : -1);
+            free(acc);
+            acc = next;
+        }
+    }
+    uint64_t h = hashmap_murmur(acc, strlen(acc), 0, 0);
+    free(acc);
+    return h;
+}
+
+static yap_type_id yap_finish_bound_type(yap_ctx* ctx, char* name, yap_type t){
+    uint64_t hash = yap_type_layout_hash(ctx, t);
+
+    yap_type_id existing_id = yap_ctx_get_type_id_by_name(ctx, name);
+    yap_type* existing = existing_id ? yap_ctx_get_type(ctx, existing_id) : NULL;
+    /* A pass-1 placeholder has no fields yet and is not a rival layout. */
+    bool placeholder = existing && existing->kind == yap_type_struct && !existing->structure.fields;
+
+    if (existing && !placeholder && yap_type_layout_hash(ctx, *existing) == hash){
+        yap_log("Bound type '%s' already described identically, sharing it", name);
+        return existing_id;
+    }
+    if (existing && !placeholder){
+        char* distinct = yap_ctx_strus_newf(ctx, "%s__%08x", name, (unsigned)(hash & 0xffffffffu));
+        yap_log("Bound type '%s' has a rival layout, emitting it as '%s'", name, distinct);
+        if (t.kind == yap_type_struct){ t.structure.name = distinct; t.structure.c_name = distinct; }
+        else if (t.kind == yap_type_union){ t.uni.name = distinct; t.uni.c_name = distinct; }
+        yap_type_id existing_distinct = yap_ctx_get_type_id_by_name(ctx, distinct);
+        if (existing_distinct) return existing_distinct;
+        return yap_ctx_push_named_type(ctx, distinct, distinct, t);
+    }
+
+    if (existing_id){
+        *yap_ctx_get_type(ctx, existing_id) = t;
+        return existing_id;
+    }
+    return yap_ctx_push_named_type(ctx, name, name, t);
+}
+
 static yap_type_id yap_finish_named_type(yap_ctx* ctx, char* name, yap_type t){
     yap_type_id existing_id = yap_ctx_get_type_id_by_name(ctx, name);
     if (existing_id){
@@ -491,12 +558,15 @@ yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tn
                 .c_name = name,
                 .name   = name
             };
-            yap_type_id id = yap_finish_named_type(ctx, name, t);
+            yap_type_id id = tnode->is_bind ? yap_finish_bound_type(ctx, name, t)
+                                            : yap_finish_named_type(ctx, name, t);
+            yap_module_record_type(yap_source_owning_module(ctx, src), name, id);
             return (yap_decl){
                 .kind = yap_decl_named_type,
                 .named_type_decl = (yap_named_type_decl){
-                    .name    = name,
-                    .c_name  = name,
+                    .name    = yap_ctx_get_type(ctx, id)->kind == yap_type_struct ? yap_ctx_get_type(ctx, id)->structure.c_name : name,
+                    .c_name  = yap_ctx_get_type(ctx, id)->kind == yap_type_struct ? yap_ctx_get_type(ctx, id)->structure.c_name : name,
+                    .is_bind = tnode->is_bind,
                     .kind    = yap_named_type_decl_struct,
                     .type_id = id
                 }
@@ -514,12 +584,15 @@ yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tn
                 .c_name   = name,
                 .name     = name
             };
-            yap_type_id id = yap_finish_named_type(ctx, name, t);
+            yap_type_id id = tnode->is_bind ? yap_finish_bound_type(ctx, name, t)
+                                            : yap_finish_named_type(ctx, name, t);
+            yap_module_record_type(yap_source_owning_module(ctx, src), name, id);
             return (yap_decl){
                 .kind = yap_decl_named_type,
                 .named_type_decl = (yap_named_type_decl){
-                    .name    = name,
-                    .c_name  = name,
+                    .name    = yap_ctx_get_type(ctx, id)->kind == yap_type_struct ? yap_ctx_get_type(ctx, id)->structure.c_name : name,
+                    .c_name  = yap_ctx_get_type(ctx, id)->kind == yap_type_struct ? yap_ctx_get_type(ctx, id)->structure.c_name : name,
+                    .is_bind = tnode->is_bind,
                     .kind    = yap_named_type_decl_enum,
                     .type_id = id
                 }
@@ -537,12 +610,15 @@ yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tn
                 .c_name   = name,
                 .name     = name
             };
-            yap_type_id id = yap_finish_named_type(ctx, name, t);
+            yap_type_id id = tnode->is_bind ? yap_finish_bound_type(ctx, name, t)
+                                            : yap_finish_named_type(ctx, name, t);
+            yap_module_record_type(yap_source_owning_module(ctx, src), name, id);
             return (yap_decl){
                 .kind = yap_decl_named_type,
                 .named_type_decl = (yap_named_type_decl){
-                    .name    = name,
-                    .c_name  = name,
+                    .name    = yap_ctx_get_type(ctx, id)->kind == yap_type_struct ? yap_ctx_get_type(ctx, id)->structure.c_name : name,
+                    .c_name  = yap_ctx_get_type(ctx, id)->kind == yap_type_struct ? yap_ctx_get_type(ctx, id)->structure.c_name : name,
+                    .is_bind = tnode->is_bind,
                     .kind    = yap_named_type_decl_union,
                     .type_id = id
                 }
@@ -555,12 +631,15 @@ yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tn
                 .c_name = name,
                 .name   = name
             };
-            yap_type_id id = yap_finish_named_type(ctx, name, t);
+            yap_type_id id = tnode->is_bind ? yap_finish_bound_type(ctx, name, t)
+                                            : yap_finish_named_type(ctx, name, t);
+            yap_module_record_type(yap_source_owning_module(ctx, src), name, id);
             return (yap_decl){
                 .kind = yap_decl_named_type,
                 .named_type_decl = (yap_named_type_decl){
-                    .name    = name,
-                    .c_name  = name,
+                    .name    = yap_ctx_get_type(ctx, id)->kind == yap_type_struct ? yap_ctx_get_type(ctx, id)->structure.c_name : name,
+                    .c_name  = yap_ctx_get_type(ctx, id)->kind == yap_type_struct ? yap_ctx_get_type(ctx, id)->structure.c_name : name,
+                    .is_bind = tnode->is_bind,
                     .kind    = yap_named_type_decl_alias,
                     .type_id = id
                 }
@@ -3192,7 +3271,8 @@ yap_type_id yap_build_type_from_type_node(yap_source* src, yap_type_node* tnode)
 
         case yap_type_node_identifier: {
             if (!tnode->identifier.value) return 0;
-            yap_type_id id = yap_ctx_get_type_id_by_name(ctx, tnode->identifier.value);
+            yap_type_id id = yap_module_lookup_type(yap_source_owning_module(ctx, src), tnode->identifier.value);
+            if (!id) id = yap_ctx_get_type_id_by_name(ctx, tnode->identifier.value);
             if (!id){
                 yap_build_push_error(src, tnode->loc, "Unknown type '%s'", tnode->identifier.value);
                 return 0;
