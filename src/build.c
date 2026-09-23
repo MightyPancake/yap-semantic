@@ -3028,6 +3028,36 @@ static yap_type_id yap_resolve_macro_type_arg(yap_source* src, yap_expr_node* ex
     return 0;
 }
 
+/* 'arr:(i32)' is shorthand for 'arr->arr:(i32)' -- a module whose headline macro carries
+ * the module's own name. It applies only when the bare name resolves to nothing else, so
+ * a local of that name always wins. Dynamically imported modules get this for free: the
+ * lookup happens here, during the build, after __import has already pulled them in. */
+static yap_expr_node* yap_pun_module_caller(yap_source* src, yap_expr_node* caller){
+    yap_ctx* ctx = src->ctx;
+    if (!caller || caller->kind != yap_expr_var || !caller->var.value) return caller;
+
+    char* name = caller->var.value;
+    for_darr(i, scope, ctx->current_scopes){
+        if (yap_scope_get_var_recursive(scope, name)) return caller;
+    }
+
+    yap_module* mod = yap_ctx_resolve_module(ctx, src, name);
+    if (!mod || !mod->scope) return caller;
+    if (!yap_scope_get_var(mod->scope, name)) return caller;
+
+    yap_log("Module pun: '%s:(...)' means '%s->%s:(...)'", name, name, name);
+    yap_expr_node punned = {
+        .kind = yap_expr_module_access,
+        .module_access = {
+            .module = (yap_identifier_node){ .value = name, .loc = caller->loc },
+            .field  = (yap_identifier_node){ .value = name, .loc = caller->loc },
+            .loc    = caller->loc,
+        },
+        .loc = caller->loc,
+    };
+    return yap_ctx_one_cpy(ctx, punned);
+}
+
 static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap_type_id* out_ret_type){
     yap_ctx* ctx = src->ctx;
     *out_ret_type = 0;
@@ -3068,7 +3098,7 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
             .is_lvalue = true, .is_comptime = false
         };
     } else {
-        caller = yap_build_expr(src, call->caller);
+        caller = yap_build_expr(src, yap_pun_module_caller(src, call->caller));
         if (caller.kind == yap_expr_error) return NULL;
     }
 
