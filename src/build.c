@@ -3194,6 +3194,25 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
                         "Comptime call argument must be a literal (use #expr to pass as AST node, or [..] for a yExprList)");
                     free(arg_ptrs); return NULL;
                 }
+
+                /* Arguments are marshalled by the literal's own kind, so nothing else
+                 * would notice a value handed to a parameter of another shape. A
+                 * yExprList is the case that matters: anything but a blob arrives as a
+                 * pointer to the wrong struct and is read as one. */
+                if (slot < expected_count){
+                    yap_type* want = yap_ctx_get_type(ctx, expected_args[slot]);
+                    yap_type* want_pointee = (want && want->kind == yap_type_ptr)
+                        ? yap_ctx_get_type(ctx, want->pointer_type) : NULL;
+                    bool wants_list = want_pointee && want_pointee->kind == yap_type_slice
+                        && want_pointee->slice.element_type == ctx->yexpr_type_id;
+                    bool gave_list = built.kind == yap_expr_literal
+                        && built.literal.kind == yap_literal_blob;
+                    if (wants_list && !gave_list){
+                        yap_build_push_error(src, param->loc,
+                            "Argument %u must be a yExprList, written as [..]", slot + 1);
+                        free(arg_ptrs); return NULL;
+                    }
+                }
                 break;
             }
             case yap_macro_param_ast: {
