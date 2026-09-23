@@ -6,6 +6,7 @@
 static yap_expr yap_build_blob_cast(yap_source* src, yap_expr blob_expr, yap_type_id target_type, yap_loc loc);
 static yap_expr yap_build_macro_expr(yap_source* src, yap_macro_call_node* call);
 static bool yap_is_comptime_type(yap_ctx* ctx, yap_type_id id);
+static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(yap_source*)* chain);
 static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap_type_id* out_ret_type);
 static yap_type_id yap_build_macro_type(yap_source* src, yap_macro_call_node* call);
 yap_type_id yap_build_type_from_type_node(yap_source* src, yap_type_node* tnode);
@@ -287,6 +288,87 @@ void yap_build_top_level_declaration(yap_source* src, yap_decl_node* node){
  *  Declarations
  * ---------------------------------------------------------------- */
 
+/* 'import m:(args)' runs m's __import macro and pulls in whatever modules it names.
+ * The macro may only choose among m's own declared deps, so the dependency graph stays
+ * the one the manifests describe and remains solvable without running anything. */
+static void yap_dispatch_parameterized_import(yap_source* src, yap_module_import_node* imp){
+    yap_ctx* ctx = src->ctx;
+    char* mod_name = imp->module_name.value;
+    if (!mod_name) return;
+
+    yap_module* provider = yap_ctx_resolve_module(ctx, src, mod_name);
+    if (!provider){
+        yap_build_push_error(src, imp->loc, "Unknown module '%s'", mod_name);
+        return;
+    }
+
+    /* Synthesised 'mod->__import' call, so this goes through the ordinary macro path. */
+    yap_expr_node caller = {
+        .kind = yap_expr_module_access,
+        .module_access = {
+            .module = imp->module_name,
+            .field  = (yap_identifier_node){ .value = "__import", .loc = imp->loc },
+            .loc    = imp->loc,
+        },
+        .loc = imp->loc,
+    };
+    yap_macro_call_node call = {
+        .caller = yap_ctx_one_cpy(ctx, caller),
+        .params = imp->params,
+        .loc    = imp->loc,
+    };
+
+    yap_type_id ret_type = 0;
+    void* result = yap_exec_macro_call(src, &call, &ret_type);
+    if (!result) return;
+
+    if (ret_type != ctx->ydecllist_type_id){
+        yap_build_push_error(src, imp->loc,
+            "'%s->__import' must return a yDeclList", mod_name);
+        return;
+    }
+
+    yap_ct_decl_list* list = result;
+    for (unsigned i = 0; i < list->count; i++){
+        yap_ct_decl d = list->items[i];
+        if (d.kind != yap_ct_decl_import_module || !d.module_name) continue;
+
+        bool declared = false;
+        if (provider->deps) for_darr(di, dep, provider->deps){
+            if (dep.name && strcmp(dep.name, d.module_name) == 0){ declared = true; break; }
+        }
+        if (!declared){
+            yap_build_push_error(src, imp->loc,
+                "'%s->__import' wants to import '%s', which is not in %s's deps",
+                mod_name, d.module_name, mod_name);
+            continue;
+        }
+
+        if (yap_ctx_resolve_module(ctx, src, d.module_name)){
+            yap_log("__import: '%s' is already loaded", d.module_name);
+            continue;
+        }
+        yap_log("__import: pulling in '%s' for '%s'", d.module_name, mod_name);
+        if (ctx->parse_module && ctx->parse_module(ctx, d.module_name, imp->loc)){
+            /* Phase 0 has already run, so the new sources are registered here. They are
+             * also built right away rather than left to the outer sweep: the source that
+             * asked for the import is still being built, and expects to use what it got. */
+            yap_register_imported_modules(ctx);
+            darr(yap_source*) chain = darr_new(yap_source*);
+            for (size_t si = 0; si < darr_len(ctx->sources); si++){
+                yap_source* added = ctx->sources[si];
+                if (!added || !added->source_node) continue;
+                if (added->source_node->status != yap_source_unvisited) continue;
+                yap_build_source_postorder(ctx, added, &chain);
+            }
+            darr_free(chain);
+        } else {
+            yap_build_push_error(src, imp->loc,
+                "'%s->__import' names '%s', which is not on any lookup path", mod_name, d.module_name);
+        }
+    }
+}
+
 yap_decl yap_build_decl(yap_source* src, yap_decl_node* node){
     yap_decl res = { .kind = yap_decl_error };
 
@@ -301,6 +383,9 @@ yap_decl yap_build_decl(yap_source* src, yap_decl_node* node){
             res = yap_build_named_type_decl(src, &node->named_type_decl);
             break;
         case yap_decl_module_import:
+            if (node->module_import.parameterized)
+                yap_dispatch_parameterized_import(src, &node->module_import);
+            break;
         case yap_decl_file_import:
         case yap_decl_module_decl:
             break;
@@ -2915,6 +3000,8 @@ static bool yap_is_comptime_type(yap_ctx* ctx, yap_type_id id){
         || id == ctx->ystmt_type_id
         || id == ctx->yfn_type_id
         || id == ctx->yexprblueprint_type_id
+        || id == ctx->ydecl_type_id
+        || id == ctx->ydecllist_type_id
         || id == ctx->void_type_id;
 }
 
