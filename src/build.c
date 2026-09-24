@@ -7,6 +7,7 @@ static yap_expr yap_build_blob_cast(yap_source* src, yap_expr blob_expr, yap_typ
 static yap_expr yap_build_macro_expr(yap_source* src, yap_macro_call_node* call);
 static bool yap_is_comptime_type(yap_ctx* ctx, yap_type_id id);
 static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(yap_source*)* chain);
+static void yap_dispatch_parameterized_import(yap_source* src, yap_module_import_node* imp);
 static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap_type_id* out_ret_type);
 static yap_type_id yap_build_macro_type(yap_source* src, yap_macro_call_node* call);
 yap_type_id yap_build_type_from_type_node(yap_source* src, yap_type_node* tnode);
@@ -106,6 +107,15 @@ static void yap_build_source_postorder(yap_ctx* ctx, yap_source* src, darr(yap_s
             pushed_module_scope = true;
             yap_log("Pushed scope for module '%s'", src->from_module_import);
         }
+    }
+
+    /* Pre-pass – dispatch parameterized imports before Pass 1 resolves parameter types.
+     * Non-parameterized imports are handled in Phase 0; parameterized ones run a macro
+     * that pulls in additional modules dynamically, so they must fire before any function
+     * signature reads a type that those modules provide (e.g. arr:(i32) as a param type). */
+    for_darr(j, dnode, snode->declarations){
+        if (dnode.kind == yap_decl_module_import && dnode.module_import.parameterized)
+            yap_dispatch_parameterized_import(src, &dnode.module_import);
     }
 
     /* Pass 1 – register top-level signatures for mutual recursion */
