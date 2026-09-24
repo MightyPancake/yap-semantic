@@ -3058,6 +3058,107 @@ static yap_expr_node* yap_pun_module_caller(yap_source* src, yap_expr_node* call
     return yap_ctx_one_cpy(ctx, punned);
 }
 
+/* What a macro-call argument is marshalled as. Every slot crosses to TCC as one void*, so this, not the literal's yap type, decides which declared parameter types can read it. */
+typedef enum {
+    yap_macro_arg_int,     // by value
+    yap_macro_arg_float,   // as a double*
+    yap_macro_arg_string,  // as a char*
+    yap_macro_arg_cstring, // as a char*
+    yap_macro_arg_bool,    // by value
+    yap_macro_arg_list,    // as a yap_yexpr_slice*
+    yap_macro_arg_expr,    // as a yap_expr* (#expr, named and mutable args)
+    yap_macro_arg_ident,   // as a char*
+    yap_macro_arg_stmt,    // as a deferred yap_statement*
+    yap_macro_arg_type,    // as a yap_type_id
+} yap_macro_arg_shape;
+
+static const char* yap_macro_arg_shape_name(yap_macro_arg_shape shape){
+    switch (shape){
+        case yap_macro_arg_int:     return "an integer literal";
+        case yap_macro_arg_float:   return "a float literal";
+        case yap_macro_arg_string:  return "a string literal";
+        case yap_macro_arg_cstring: return "a c-string literal";
+        case yap_macro_arg_bool:    return "a bool literal";
+        case yap_macro_arg_list:    return "a list [..]";
+        case yap_macro_arg_expr:    return "an expression";
+        case yap_macro_arg_ident:   return "a +ident";
+        case yap_macro_arg_stmt:    return "a statement";
+        case yap_macro_arg_type:    return "a type";
+    }
+    return "an argument";
+}
+
+// By name, since yap_ctx_types_eq can't tell same-sized primitives apart (bool == byte, yExpr == u64).
+static bool yap_is_primitive_named(yap_ctx* ctx, yap_type_id id, char* name){
+    yap_type* t = yap_ctx_get_type(ctx, id);
+    return t && t->kind == yap_type_primitive && t->primitive.name && strus_eq(t->primitive.name, name);
+}
+
+static bool yap_is_yexprlist_ptr(yap_ctx* ctx, yap_type_id id){
+    yap_type* t = yap_ctx_get_type(ctx, id);
+    yap_type* pointee = (t && t->kind == yap_type_ptr) ? yap_ctx_get_type(ctx, t->pointer_type) : NULL;
+    // Structural: 'yExpr[]@' and 'yExprList@' resolve to the same anonymous slice type
+    return pointee && pointee->kind == yap_type_slice && pointee->slice.element_type == ctx->yexpr_type_id;
+}
+
+// Opaque comptime handles are registered as 8-byte primitives, so they'd otherwise pass for integers.
+static bool yap_is_comptime_handle(yap_ctx* ctx, yap_type_id id){
+    return yap_is_comptime_type(ctx, id)
+        || id == ctx->yident_type_id
+        || id == ctx->ystmtblueprint_type_id
+        || id == ctx->ystmtlist_type_id
+        || id == ctx->ycallargs_type_id
+        || id == ctx->ystructt_type_id
+        || id == ctx->yenumt_type_id
+        || id == ctx->yuniont_type_id
+        || id == ctx->yfnt_type_id;
+}
+
+static bool yap_macro_arg_fits(yap_ctx* ctx, yap_macro_arg_shape shape, yap_type_id want){
+    yap_type* t = yap_ctx_get_type(ctx, want);
+    if (!t) return false;
+    yap_type_id pointee = (t->kind == yap_type_ptr) ? t->pointer_type : 0;
+    switch (shape){
+        case yap_macro_arg_int:
+            return t->kind == yap_type_primitive && !t->primitive.is_float && t->primitive.bytes > 0
+                && !yap_is_primitive_named(ctx, want, "bool") && !yap_is_comptime_handle(ctx, want);
+        case yap_macro_arg_float:   return pointee && yap_is_primitive_named(ctx, pointee, "f64");
+        case yap_macro_arg_string:
+        case yap_macro_arg_cstring: return pointee && yap_is_primitive_named(ctx, pointee, "byte");
+        case yap_macro_arg_bool:    return yap_is_primitive_named(ctx, want, "bool");
+        case yap_macro_arg_list:    return yap_is_yexprlist_ptr(ctx, want);
+        case yap_macro_arg_expr:    return want == ctx->yexpr_type_id;
+        case yap_macro_arg_ident:   return want == ctx->yident_type_id;
+        case yap_macro_arg_stmt:    return want == ctx->ystmt_type_id;
+        case yap_macro_arg_type:    return want == ctx->ytype_type_id;
+    }
+    return false;
+}
+
+static bool yap_check_macro_arg(yap_source* src, yap_loc loc, unsigned int slot, yap_type_id want, yap_macro_arg_shape shape){
+    yap_ctx* ctx = src->ctx;
+    if (yap_macro_arg_fits(ctx, shape, want)) return true;
+
+    yap_type* t = yap_ctx_get_type(ctx, want);
+    const char* hint = "";
+    if (yap_is_yexprlist_ptr(ctx, want))
+        hint = " ; a yExprList is written as [..]";
+    else if (want == ctx->yexpr_type_id)
+        hint = " ; use #expr to pass an expression";
+    else if (want == ctx->yident_type_id)
+        hint = " ; use +name to pass an identifier";
+    else if (t && t->kind == yap_type_primitive && t->primitive.is_float)
+        hint = " ; a float argument arrives as a pointer, so declare the parameter f64@";
+
+    char* want_str = !t ? strus_copy("(invalid type)")
+        : yap_is_yexprlist_ptr(ctx, want) ? strus_copy("yExprList@")
+        : yap_ctx_type_id_to_string(ctx, want);
+    yap_build_push_error(src, loc, "Argument %u: expected %s, given %s%s",
+        slot + 1, want_str, yap_macro_arg_shape_name(shape), hint);
+    free(want_str);
+    return false;
+}
+
 static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap_type_id* out_ret_type){
     yap_ctx* ctx = src->ctx;
     *out_ret_type = 0;
@@ -3160,68 +3261,83 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
 
         switch (param->kind){
             case yap_macro_param_type: {
-                yap_build_push_error(src, param->loc, "Type argument provided where a value was expected");
+                if (slot < expected_count)
+                    yap_check_macro_arg(src, param->loc, slot, expected_arg_type, yap_macro_arg_type);
+                else
+                    yap_build_push_error(src, param->loc, "Type argument provided where a value was expected");
                 free(arg_ptrs); return NULL;
             }
             case yap_macro_param_unnamed: {
                 yap_expr built = yap_build_expr(src, param->expr);
                 if (built.kind == yap_expr_error){ free(arg_ptrs); return NULL; }
-                if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_numerical){
-                    if (strchr(built.literal.text, '.'))
-                        { double v = atof(built.literal.text); double* p = yap_ctx_one(ctx, double); *p = v; arg_ptrs[slot] = p; }
-                    else
-                        { long v = atol(built.literal.text); arg_ptrs[slot] = (void*)(uintptr_t)v; }
-                } else if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_string){
-                    arg_ptrs[slot] = (void*)built.literal.text;
-                } else if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_cstring){
-                    arg_ptrs[slot] = (void*)built.literal.text;
-                } else if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_bool){
-                    arg_ptrs[slot] = (void*)(uintptr_t)(strus_eq(built.literal.text, "true") ? 1 : 0);
-                } else if (built.kind == yap_expr_literal && built.literal.kind == yap_literal_blob){
-                    /* A yExpr value is an 8-byte opaque handle (pointer to a struct), but the blob builds a contiguous array of the structs themselves, so the slice's data array needs one pointer per element -- build that indirection here, passed by address since void*-per-slot can't carry a 2-word struct directly (callee param type must be 'yExprList@', not bare 'yExprList'). */
-                    unsigned int blob_count = built.literal.blob.field_count;
-                    yap_expr** elem_ptrs = blob_count
-                        ? (yap_expr**)yap_ctx_one_raw(ctx, sizeof(yap_expr*) * blob_count)
-                        : NULL;
-                    for (unsigned int bi = 0; bi < blob_count; bi++)
-                        elem_ptrs[bi] = &built.literal.blob.elements[bi];
-                    yap_yexpr_slice* slice = yap_ctx_one(ctx, yap_yexpr_slice);
-                    slice->data = elem_ptrs;
-                    slice->len  = blob_count;
-                    arg_ptrs[slot] = slice;
-                } else {
+                yap_macro_arg_shape shape;
+                yap_literal_kind lit_kind = (built.kind == yap_expr_literal) ? built.literal.kind : (yap_literal_kind)-1;
+                if (lit_kind == yap_literal_numerical)
+                    shape = (built.type == ctx->untyped_float_type_id) ? yap_macro_arg_float : yap_macro_arg_int;
+                else if (lit_kind == yap_literal_string)  shape = yap_macro_arg_string;
+                else if (lit_kind == yap_literal_cstring) shape = yap_macro_arg_cstring;
+                else if (lit_kind == yap_literal_bool)    shape = yap_macro_arg_bool;
+                else if (lit_kind == yap_literal_blob)    shape = yap_macro_arg_list;
+                else {
                     yap_build_push_error(src, param->loc,
                         "Comptime call argument must be a literal (use #expr to pass as AST node, or [..] for a yExprList)");
                     free(arg_ptrs); return NULL;
                 }
 
-                /* Arguments are marshalled by the literal's own kind, so nothing else
-                 * would notice a value handed to a parameter of another shape. A
-                 * yExprList is the case that matters: anything but a blob arrives as a
-                 * pointer to the wrong struct and is read as one. */
                 if (slot < expected_count){
-                    yap_type* want = yap_ctx_get_type(ctx, expected_args[slot]);
-                    yap_type* want_pointee = (want && want->kind == yap_type_ptr)
-                        ? yap_ctx_get_type(ctx, want->pointer_type) : NULL;
-                    bool wants_list = want_pointee && want_pointee->kind == yap_type_slice
-                        && want_pointee->slice.element_type == ctx->yexpr_type_id;
-                    bool gave_list = built.kind == yap_expr_literal
-                        && built.literal.kind == yap_literal_blob;
-                    if (wants_list && !gave_list){
-                        yap_build_push_error(src, param->loc,
-                            "Argument %u must be a yExprList, written as [..]", slot + 1);
+                    if (!yap_check_macro_arg(src, param->loc, slot, expected_arg_type, shape)
+                        || !yap_check_literal_range(src, param->loc, built, expected_arg_type)){
                         free(arg_ptrs); return NULL;
+                    }
+                }
+
+                switch (shape){
+                    case yap_macro_arg_float: {
+                        double* p = yap_ctx_one(ctx, double);
+                        *p = strtod(built.literal.text, NULL);
+                        arg_ptrs[slot] = p;
+                        break;
+                    }
+                    case yap_macro_arg_int:
+                        arg_ptrs[slot] = (void*)(uintptr_t)strtoull(built.literal.text, NULL, 10);
+                        break;
+                    case yap_macro_arg_string:
+                    case yap_macro_arg_cstring:
+                        arg_ptrs[slot] = (void*)built.literal.text;
+                        break;
+                    case yap_macro_arg_bool:
+                        arg_ptrs[slot] = (void*)(uintptr_t)(strus_eq(built.literal.text, "true") ? 1 : 0);
+                        break;
+                    default: {
+                        /* A yExpr value is an 8-byte opaque handle (pointer to a struct), but the blob builds a contiguous array of the structs themselves, so the slice's data array needs one pointer per element -- build that indirection here, passed by address since void*-per-slot can't carry a 2-word struct directly (callee param type must be 'yExprList@', not bare 'yExprList'). */
+                        unsigned int blob_count = built.literal.blob.field_count;
+                        yap_expr** elem_ptrs = blob_count
+                            ? (yap_expr**)yap_ctx_one_raw(ctx, sizeof(yap_expr*) * blob_count)
+                            : NULL;
+                        for (unsigned int bi = 0; bi < blob_count; bi++)
+                            elem_ptrs[bi] = &built.literal.blob.elements[bi];
+                        yap_yexpr_slice* slice = yap_ctx_one(ctx, yap_yexpr_slice);
+                        slice->data = elem_ptrs;
+                        slice->len  = blob_count;
+                        arg_ptrs[slot] = slice;
+                        break;
                     }
                 }
                 break;
             }
             case yap_macro_param_ast: {
+                if (slot < expected_count && !yap_check_macro_arg(src, param->loc, slot, expected_arg_type, yap_macro_arg_expr)){
+                    free(arg_ptrs); return NULL;
+                }
                 yap_expr built = yap_build_expr(src, param->expr);
                 if (built.kind == yap_expr_error){ free(arg_ptrs); return NULL; }
                 arg_ptrs[slot] = yap_ctx_one_cpy(ctx, built);
                 break;
             }
             case yap_macro_param_named: {
+                if (slot < expected_count && !yap_check_macro_arg(src, param->loc, slot, expected_arg_type, yap_macro_arg_expr)){
+                    free(arg_ptrs); return NULL;
+                }
                 if (!param->named.value){
                     yap_build_push_error(src, param->loc, "Missing value in named macro parameter");
                     free(arg_ptrs); return NULL;
@@ -3232,6 +3348,9 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
                 break;
             }
             case yap_macro_param_ident_add: {
+                if (slot < expected_count && !yap_check_macro_arg(src, param->loc, slot, expected_arg_type, yap_macro_arg_ident)){
+                    free(arg_ptrs); return NULL;
+                }
                 char* name = param->ident_add.value;
                 if (!name){ free(arg_ptrs); return NULL; }
                 const yap_var* existing = yap_scope_get_var_recursive(
@@ -3245,6 +3364,9 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
                 break;
             }
             case yap_macro_param_mut: {
+                if (slot < expected_count && !yap_check_macro_arg(src, param->loc, slot, expected_arg_type, yap_macro_arg_expr)){
+                    free(arg_ptrs); return NULL;
+                }
                 yap_expr built = yap_build_expr(src, param->mut_expr);
                 if (built.kind == yap_expr_error){ free(arg_ptrs); return NULL; }
                 if (!built.is_lvalue){
@@ -3255,6 +3377,9 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
                 break;
             }
             case yap_macro_param_statement: {
+                if (slot < expected_count && !yap_check_macro_arg(src, param->loc, slot, expected_arg_type, yap_macro_arg_stmt)){
+                    free(arg_ptrs); return NULL;
+                }
                 /* A raw statement/block macro arg can't be built now -- it may reference hygienic idents the macro hasn't introduced yet (only true once its returned yStmt is spliced back in, see yap_resolve_deferred_fragments). Passed through as an opaque sentinel carrying the unbuilt parse node. */
                 yap_statement* deferred = yap_ctx_one(ctx, yap_statement);
                 *deferred = (yap_statement){
@@ -3272,12 +3397,7 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
     }
 
     if (provided_count != expected_count){
-        yap_type* last_expected = (expected_count > 0) ? yap_ctx_get_type(ctx, expected_args[expected_count - 1]) : NULL;
-        // Structural check: 'yExpr[]@' and 'yExprList@' resolve to the same anonymous slice type
-        yap_type* last_pointee = (last_expected && last_expected->kind == yap_type_ptr)
-            ? yap_ctx_get_type(ctx, last_expected->pointer_type) : NULL;
-        bool last_is_yexprlist_ptr = last_pointee && last_pointee->kind == yap_type_slice
-            && last_pointee->slice.element_type == ctx->yexpr_type_id;
+        bool last_is_yexprlist_ptr = expected_count > 0 && yap_is_yexprlist_ptr(ctx, expected_args[expected_count - 1]);
         bool defaulted_empty_list = expected_count > 0
             && provided_count == expected_count - 1
             && last_is_yexprlist_ptr;
