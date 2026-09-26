@@ -2766,10 +2766,10 @@ yap_expr yap_build_member_access_expr(yap_source* src, yap_member_access_node* m
 
     yap_type* obj_type = yap_ctx_get_type(ctx, object.type);
 
-    /* Auto-deref: 'ptr.field' transparently dereferences a pointer to struct/union before accessing the member, since '->' is already taken for module access here. An explicit 'ptr..field' still works too: by the time it reaches here 'object' is already struct-typed and this branch doesn't trigger. */
+    /* Auto-deref: 'ptr.field' transparently dereferences a pointer to struct/union/slice before accessing the member, since '->' is already taken for module access here. An explicit 'ptr..field' still works too: by the time it reaches here 'object' is already struct-typed and this branch doesn't trigger. */
     if (obj_type && obj_type->kind == yap_type_ptr){
         yap_type* pointee_type = yap_ctx_get_type(ctx, obj_type->pointer_type);
-        if (pointee_type && (pointee_type->kind == yap_type_struct || pointee_type->kind == yap_type_union)){
+        if (pointee_type && (pointee_type->kind == yap_type_struct || pointee_type->kind == yap_type_union || pointee_type->kind == yap_type_slice)){
             object = (yap_expr){
                 .kind        = yap_expr_deref,
                 .subexpr     = yap_ctx_one_cpy(ctx, object),
