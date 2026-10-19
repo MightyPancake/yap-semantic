@@ -638,7 +638,16 @@ static yap_type_id yap_finish_named_type(yap_ctx* ctx, yap_module* owner, char* 
     char* cname = prefix ? yap_ctx_strus_newf(ctx, "%s%s", prefix, name) : name;
     if (t.kind == yap_type_struct){ t.structure.name = name; t.structure.c_name = cname; }
     else if (t.kind == yap_type_union){ t.uni.name = name; t.uni.c_name = cname; }
-    else if (t.kind == yap_type_enum){ t.enumeration.name = name; t.enumeration.c_name = cname; }
+    else if (t.kind == yap_type_enum){
+        t.enumeration.name = name; t.enumeration.c_name = cname;
+        /* C scopes enum constants outside the enum, so variants need the type's C name
+         * too or two enums sharing one collide. Bound enums keep their header's names. */
+        if (t.enumeration.variants){
+            for_darr_elems(v, t.enumeration.variants){
+                v->c_name = yap_ctx_strus_newf(ctx, "%s_%s", cname, v->name);
+            }
+        }
+    }
 
     yap_type_id by_cname = yap_ctx_get_type_id_by_name(ctx, cname);
     if (by_cname){
@@ -709,8 +718,8 @@ yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tn
             return (yap_decl){
                 .kind = yap_decl_named_type,
                 .named_type_decl = (yap_named_type_decl){
-                    .name    = yap_ctx_get_type(ctx, id)->kind == yap_type_struct ? yap_ctx_get_type(ctx, id)->structure.c_name : name,
-                    .c_name  = yap_ctx_get_type(ctx, id)->kind == yap_type_struct ? yap_ctx_get_type(ctx, id)->structure.c_name : name,
+                    .name    = yap_ctx_get_type(ctx, id)->kind == yap_type_enum ? yap_ctx_get_type(ctx, id)->enumeration.c_name : name,
+                    .c_name  = yap_ctx_get_type(ctx, id)->kind == yap_type_enum ? yap_ctx_get_type(ctx, id)->enumeration.c_name : name,
                     .is_bind = tnode->is_bind,
                     .kind    = yap_named_type_decl_enum,
                     .type_id = id
@@ -736,8 +745,8 @@ yap_decl yap_build_named_type_decl(yap_source* src, yap_named_type_decl_node* tn
             return (yap_decl){
                 .kind = yap_decl_named_type,
                 .named_type_decl = (yap_named_type_decl){
-                    .name    = yap_ctx_get_type(ctx, id)->kind == yap_type_struct ? yap_ctx_get_type(ctx, id)->structure.c_name : name,
-                    .c_name  = yap_ctx_get_type(ctx, id)->kind == yap_type_struct ? yap_ctx_get_type(ctx, id)->structure.c_name : name,
+                    .name    = yap_ctx_get_type(ctx, id)->kind == yap_type_union ? yap_ctx_get_type(ctx, id)->uni.c_name : name,
+                    .c_name  = yap_ctx_get_type(ctx, id)->kind == yap_type_union ? yap_ctx_get_type(ctx, id)->uni.c_name : name,
                     .is_bind = tnode->is_bind,
                     .kind    = yap_named_type_decl_union,
                     .type_id = id
@@ -2760,6 +2769,34 @@ yap_expr yap_build_ternary_expr(yap_source* src, yap_ternary_node* ter){
 
 yap_expr yap_build_member_access_expr(yap_source* src, yap_member_access_node* ma){
     yap_ctx* ctx = src->ctx;
+
+    /* Enum variant access: 'Mood.calm'. Runs before yap_build_expr, which would reject
+     * the type name as an undefined variable. Variables are checked first, so a local
+     * still shadows the type. */
+    if (ma->object && ma->object->kind == yap_expr_var
+        && ma->object->var.value && ma->member.value
+        && !yap_scope_get_var_recursive(yap_ctx_current_scope(ctx), ma->object->var.value)){
+        char* tname = ma->object->var.value;
+        yap_type_id enum_id = yap_module_lookup_type(yap_source_owning_module(ctx, src), tname);
+        if (!enum_id) enum_id = yap_ctx_get_type_id_by_name(ctx, tname);
+        yap_type* enum_t = enum_id ? yap_ctx_get_type(ctx, enum_id) : NULL;
+        if (enum_t && enum_t->kind == yap_type_enum){
+            for_darr(i, v, enum_t->enumeration.variants){
+                if (v.name && strcmp(v.name, ma->member.value) == 0){
+                    return (yap_expr){
+                        .kind        = yap_expr_var,
+                        .var_name    = v.c_name ? v.c_name : v.name,
+                        .type        = enum_id,
+                        .is_lvalue   = false,
+                        .is_comptime = false
+                    };
+                }
+            }
+            yap_build_push_error(src, ma->loc, "Enum '%s' has no variant named '%s'",
+                tname, ma->member.value);
+            return (yap_expr){ .kind = yap_expr_error };
+        }
+    }
 
     yap_expr object = yap_build_expr(src, ma->object);
     if (object.kind == yap_expr_error) return (yap_expr){ .kind = yap_expr_error };
