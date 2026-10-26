@@ -494,7 +494,10 @@ yap_decl yap_build_fn_def(yap_source* src, yap_func_decl_node* fnode){
         }
     }
 
+    yap_type_id outer_ret = ctx->build_ret_type;
+    ctx->build_ret_type = fn_type.return_type;
     yap_block body = yap_build_block(src, &fnode->body);
+    ctx->build_ret_type = outer_ret;
     yap_ctx_pop_scope(ctx);
 
     return (yap_decl){
@@ -1076,6 +1079,24 @@ yap_statement yap_build_return_statement(yap_source* src, yap_return_statement_n
     yap_expr val = yap_build_expr(src, &rnode->value);
     if (val.kind == yap_expr_error)
         return (yap_statement){ .kind = yap_statement_error };
+
+    // Same treatment as a call argument: a blob takes the return type, anything else must be compatible with it.
+    yap_type_id want = ctx->build_ret_type;
+    if (want){
+        yap_type* val_t = yap_ctx_get_type(ctx, val.type);
+        if (val_t && val_t->kind == yap_type_blob){
+            val = yap_build_blob_cast(src, val, want, rnode->loc);
+            if (val.kind == yap_expr_error)
+                return (yap_statement){ .kind = yap_statement_error };
+        } else if (!yap_ctx_type_id_compatible(ctx, val.type, want)){
+            char* want_str = yap_ctx_type_id_to_string(ctx, want);
+            char* got_str  = yap_ctx_type_id_to_string(ctx, val.type);
+            yap_build_push_error(src, rnode->loc,
+                "Return type mismatch: expected '%s', got '%s'", want_str, got_str);
+            free(want_str); free(got_str);
+            return (yap_statement){ .kind = yap_statement_error };
+        }
+    }
 
     return (yap_statement){
         .kind        = yap_statement_return,
@@ -1840,7 +1861,10 @@ static yap_expr yap_build_func_literal_expr(yap_source* src, yap_func_literal_no
     for_darr(ai, arg, args){
         yap_scope_set_var(func_scope, (yap_var){ .name = arg.name, .type = arg.type });
     }
+    yap_type_id outer_ret = ctx->build_ret_type;
+    ctx->build_ret_type = return_type;
     yap_block body = yap_build_block(src, &fnode->body);
+    ctx->build_ret_type = outer_ret;
     yap_ctx_pop_scope(ctx);
     if (body.kind == yap_block_error)
         return (yap_expr){ .kind = yap_expr_error };
@@ -2461,6 +2485,14 @@ yap_expr yap_build_func_call_expr(yap_source* src, yap_func_call_node* call){
     };
 }
 
+// A nested blob element takes its slot's type, the same as a top-level one.
+static bool yap_cast_nested_blob(yap_source* src, yap_expr* elem, yap_type_id slot_type, yap_loc loc){
+    yap_type* t = yap_ctx_get_type(src->ctx, elem->type);
+    if (!t || t->kind != yap_type_blob) return true;
+    *elem = yap_build_blob_cast(src, *elem, slot_type, loc);
+    return elem->kind != yap_expr_error;
+}
+
 static yap_expr yap_build_blob_cast(yap_source* src, yap_expr blob_expr, yap_type_id target_type, yap_loc loc){
     yap_ctx* ctx = src->ctx;
     yap_blob blob = blob_expr.literal.blob;
@@ -2502,6 +2534,7 @@ static yap_expr yap_build_blob_cast(yap_source* src, yap_expr blob_expr, yap_typ
         for (unsigned int i = 0; i < blob.field_count; i++){
             char* name = blob.names[i];
             yap_expr elem = blob.elements[i];
+            unsigned int slot = 0;
             if (name){
                 bool found = false;
                 for (unsigned int fi = 0; fi < nfields; fi++){
@@ -2512,6 +2545,7 @@ static yap_expr yap_build_blob_cast(yap_source* src, yap_expr blob_expr, yap_typ
                         }
                         used[fi] = true;
                         found = true;
+                        slot = fi;
                         break;
                     }
                 }
@@ -2526,8 +2560,11 @@ static yap_expr yap_build_blob_cast(yap_source* src, yap_expr blob_expr, yap_typ
                     return (yap_expr){ .kind = yap_expr_error };
                 }
                 used[pos_idx] = true;
+                slot = pos_idx;
                 pos_idx++;
             }
+            if (!yap_cast_nested_blob(src, &elem, fields[slot].type, loc))
+                return (yap_expr){ .kind = yap_expr_error };
             darr_push(ordered, elem);
             darr_push(ordered_names, name);
         }
@@ -2556,16 +2593,23 @@ static yap_expr yap_build_blob_cast(yap_source* src, yap_expr blob_expr, yap_typ
     }
 
     if (target->kind == yap_type_array){
-        if (blob.field_count != target->array.size){
+        // `{}` is the zero value, like an empty struct blob; otherwise every slot must be given.
+        if (blob.field_count != 0 && blob.field_count != target->array.size){
             yap_build_push_error(src, loc, "Blob has %u elements, array has %zu slots",
                 blob.field_count, target->array.size);
             return (yap_expr){ .kind = yap_expr_error };
         }
+        for (unsigned int i = 0; i < blob.field_count; i++)
+            if (!yap_cast_nested_blob(src, &blob.elements[i], target->array.element_type, loc))
+                return (yap_expr){ .kind = yap_expr_error };
         blob_expr.type = target_type;
         return blob_expr;
     }
 
     if (target->kind == yap_type_slice){
+        for (unsigned int i = 0; i < blob.field_count; i++)
+            if (!yap_cast_nested_blob(src, &blob.elements[i], target->slice.element_type, loc))
+                return (yap_expr){ .kind = yap_expr_error };
         blob_expr.type = target_type;
         return blob_expr;
     }
@@ -3055,7 +3099,7 @@ static bool yap_is_comptime_type(yap_ctx* ctx, yap_type_id id){
 /* Matches the compiled slice's runtime shape ('struct { T* data; unsigned long len; }'). Macro-call args marshal to TCC one void* pointer-sized value per slot, so a 2-word by-value slice can't cross directly: blob-literal args build one of these on the arena and pass its address, with the callee's declared param type a pointer to the slice, not the slice itself. */
 typedef struct { void* data; unsigned long len; } yap_yexpr_slice;
 
-/* Resolves a macro-call argument written in a yType-expecting slot (e.g. `pair:(i32, i32)`) when it parsed as an ordinary expression, since compound-type spellings like `byte@` have no dedicated "type expression" grammar and arrive as at_op/paren/nested-macro-call nodes instead. Array/slice/function/const-type spellings parse as a distinct yap_macro_param_type and go through yap_build_type_from_type_node instead (see caller). */
+/* Resolves a macro-call argument written in a yType-expecting slot (e.g. `pair:(i32, i32)`) when it parsed as an ordinary expression, since compound-type spellings like `byte@` have no dedicated "type expression" grammar and arrive as at_op/paren/nested-macro-call nodes instead. `T[N]` arrives as an index expression. Slice/function/const-type spellings parse as a distinct yap_macro_param_type and go through yap_build_type_from_type_node instead (see caller). */
 static yap_type_id yap_resolve_macro_type_arg(yap_source* src, yap_expr_node* expr){
     yap_ctx* ctx = src->ctx;
     if (!expr) return 0;
@@ -3068,6 +3112,14 @@ static yap_type_id yap_resolve_macro_type_arg(yap_source* src, yap_expr_node* ex
     }
     if (expr->kind == yap_expr_paren){
         return yap_resolve_macro_type_arg(src, expr->paren.expr);
+    }
+    // `T[N]` in a macro arg parses as an index expression; a yType slot reads it as an array type.
+    if (expr->kind == yap_expr_index_access){
+        yap_expr_node* sz = expr->index_access.index;
+        if (!sz || sz->kind != yap_expr_literal || sz->literal.kind != yap_literal_numerical) return 0;
+        yap_type_id inner = yap_resolve_macro_type_arg(src, expr->index_access.object);
+        if (!inner) return 0;
+        return yap_ctx_get_array_of_type_id(ctx, inner, (size_t)atol(sz->literal.numerical));
     }
     if (expr->kind == yap_expr_macro){
         return yap_build_macro_type(src, &expr->macro_call);
@@ -3126,7 +3178,7 @@ static const char* yap_macro_arg_shape_name(yap_macro_arg_shape shape){
         case yap_macro_arg_string:  return "a string literal";
         case yap_macro_arg_cstring: return "a c-string literal";
         case yap_macro_arg_bool:    return "a bool literal";
-        case yap_macro_arg_list:    return "a list [..]";
+        case yap_macro_arg_list:    return "a list {..}";
         case yap_macro_arg_expr:    return "an expression";
         case yap_macro_arg_ident:   return "a +ident";
         case yap_macro_arg_stmt:    return "a statement";
@@ -3189,7 +3241,7 @@ static bool yap_check_macro_arg(yap_source* src, yap_loc loc, unsigned int slot,
     yap_type* t = yap_ctx_get_type(ctx, want);
     const char* hint = "";
     if (yap_is_yexprlist_ptr(ctx, want))
-        hint = " ; a yExprList is written as [..]";
+        hint = " ; a yExprList is written as {..}";
     else if (want == ctx->yexpr_type_id)
         hint = " ; use #expr to pass an expression";
     else if (want == ctx->yident_type_id)
@@ -3315,6 +3367,26 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
                 free(arg_ptrs); return NULL;
             }
             case yap_macro_param_unnamed: {
+                // The grammar can't tell an empty block arg from an empty blob, so `{}` is a blob there; a yStmt param takes it as an empty block.
+                if (expected_arg_type == ctx->ystmt_type_id && param->expr->kind == yap_expr_literal
+                    && param->expr->literal.kind == yap_literal_blob && darr_len(param->expr->literal.blob_elements) == 0){
+                    yap_statement_node* empty = yap_ctx_one(ctx, yap_statement_node);
+                    *empty = (yap_statement_node){
+                        .kind = yap_statement_block,
+                        .block = { .statements = yap_ctx_darr_new(ctx, yap_statement_node, .cap=0, .len=0), .loc = param->loc },
+                        .loc = param->loc
+                    };
+                    yap_statement* deferred = yap_ctx_one(ctx, yap_statement);
+                    *deferred = (yap_statement){ .kind = yap_statement_deferred, .deferred_raw = empty, .loc = param->loc };
+                    arg_ptrs[slot] = deferred;
+                    break;
+                }
+                // `T[N]`/`T@` parse as expressions, but a value slot only takes literals, so if one names a type, report it as a type.
+                if ((param->expr->kind == yap_expr_index_access || param->expr->kind == yap_expr_at_op)
+                    && slot < expected_count && yap_resolve_macro_type_arg(src, param->expr)){
+                    yap_check_macro_arg(src, param->loc, slot, expected_arg_type, yap_macro_arg_type);
+                    free(arg_ptrs); return NULL;
+                }
                 yap_expr built = yap_build_expr(src, param->expr);
                 if (built.kind == yap_expr_error){ free(arg_ptrs); return NULL; }
                 yap_macro_arg_shape shape;
@@ -3327,7 +3399,7 @@ static void* yap_exec_macro_call(yap_source* src, yap_macro_call_node* call, yap
                 else if (lit_kind == yap_literal_blob)    shape = yap_macro_arg_list;
                 else {
                     yap_build_push_error(src, param->loc,
-                        "Comptime call argument must be a literal (use #expr to pass as AST node, or [..] for a yExprList)");
+                        "Comptime call argument must be a literal (use #expr to pass as AST node, or {..} for a yExprList)");
                     free(arg_ptrs); return NULL;
                 }
 
