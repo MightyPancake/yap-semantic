@@ -2009,6 +2009,46 @@ yap_expr yap_build_literal_expr(yap_source* src, yap_literal_node* lit){
     return res;
 }
 
+/* Bare-name fallback: only modules this source imports itself, unlike 'mod->x', which also sees its module's other files' imports. */
+static const yap_var* yap_lookup_in_imported_modules(yap_source* src, char* name, yap_loc loc, yap_module** out_mod, bool* failed){
+    yap_ctx* ctx = src->ctx;
+    *out_mod = NULL;
+    *failed = false;
+    darr(yap_module*) found = darr_new(yap_module*);
+    const yap_var* var = NULL;
+    yap_module* self = yap_source_owning_module(ctx, src);
+
+    for_darr(ii, imp, src->imports){
+        if (imp.kind != yap_import_module || !imp.module_key) continue;
+        yap_module* m = yap_ctx_get_module(ctx, imp.module_key);
+        if (!m || !m->scope || m == self) continue;
+        bool seen = false;
+        for_darr(fi, f, found) if (f == m){ seen = true; break; }
+        if (seen) continue;
+        const yap_var* v = yap_scope_get_var(m->scope, name);
+        if (!v) continue;
+        darr_push(found, m);
+        var = v;
+    }
+
+    if (darr_len(found) == 1){
+        *out_mod = found[0];
+    } else if (darr_len(found) > 1){
+        char* list = strus_copy(found[0]->name);
+        for (size_t i = 1; i < darr_len(found); i++){
+            char* next = strus_newf("%s, %s", list, found[i]->name);
+            free(list);
+            list = next;
+        }
+        yap_build_push_error(src, loc, "Ambiguous reference to '%s'; exists in modules: %s", name, list);
+        free(list);
+        var = NULL;
+        *failed = true;
+    }
+    darr_free(found);
+    return var;
+}
+
 yap_expr yap_build_var_access_expr(yap_source* src, yap_identifier_node* ident){
     yap_ctx* ctx = src->ctx;
 
@@ -2019,8 +2059,24 @@ yap_expr yap_build_var_access_expr(yap_source* src, yap_identifier_node* ident){
 
     const yap_var* var = yap_scope_get_var_recursive(yap_ctx_current_scope(ctx), ident->value);
     if (!var){
-        yap_build_push_error(src, ident->loc, "Undefined variable '%s'", ident->value);
-        return (yap_expr){ .kind = yap_expr_error };
+        yap_module* from = NULL;
+        bool failed = false;
+        var = yap_lookup_in_imported_modules(src, ident->value, ident->loc, &from, &failed);
+        if (failed) return (yap_expr){ .kind = yap_expr_error };
+        if (!var){
+            yap_build_push_error(src, ident->loc, "Undefined variable '%s'", ident->value);
+            return (yap_expr){ .kind = yap_expr_error };
+        }
+        char* emit_name = (from->prefix && from->prefix[0])
+            ? yap_ctx_strus_newf(ctx, "%s%s", from->prefix, var->name)
+            : var->name;
+        return (yap_expr){
+            .kind        = yap_expr_var,
+            .var_name    = emit_name,
+            .type        = var->type,
+            .is_lvalue   = true,
+            .is_comptime = false
+        };
     }
 
     char* emit_name = var->name;
