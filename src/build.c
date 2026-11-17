@@ -275,6 +275,15 @@ void yap_build_top_level_declaration(yap_source* src, yap_decl_node* node){
             yap_log("Pass 1: registered function '%s'", emit_name);
             break;
         }
+        case yap_decl_global_var: {
+            yap_var_decl_node* v = &node->global_var.var_decl;
+            if (!v->name.value || !v->has_type || !v->type_node) break;
+            yap_type_id tid = yap_build_type_from_type_node(src, v->type_node);
+            if (!tid) break; // reported again, with context, in Pass 2
+            yap_ctx_push_var(ctx, (yap_var){ .name = v->name.value, .type = tid });
+            yap_log("Pass 1: registered global '%s'", v->name.value);
+            break;
+        }
         case yap_decl_named_type: {
             const char *name = node->named_type_decl.name.value;
             if (!name) break;
@@ -379,6 +388,41 @@ static void yap_dispatch_parameterized_import(yap_source* src, yap_module_import
     }
 }
 
+static yap_decl yap_build_global_var(yap_source* src, yap_global_var_node* gv){
+    yap_ctx* ctx = src->ctx;
+    yap_var_decl_node* v = &gv->var_decl;
+    yap_decl err = { .kind = yap_decl_error };
+
+    if (gv->is_bind){
+        yap_type_id tid = v->type_node ? yap_build_type_from_type_node(src, v->type_node) : 0;
+        if (!tid){
+            yap_build_push_error(src, v->loc, "Invalid type in bind declaration of '%s'",
+                v->name.value ? v->name.value : "?");
+            return err;
+        }
+        yap_var var = { .name = v->name.value, .type = tid };
+        yap_ctx_push_var(ctx, var);
+        return (yap_decl){
+            .kind = yap_decl_global_var,
+            .global_var = {
+                .var_decl = { .kind = yap_var_decl_valid, .var = var, .has_init = false },
+                .is_bind = true,
+            },
+        };
+    }
+
+    if (v->name.is_hole){
+        yap_build_push_error(src, v->loc, "Blueprint hole is not allowed in a global's name");
+        return err;
+    }
+    yap_statement st = yap_build_var_decl_statement(src, v);
+    if (st.kind != yap_statement_var_decl) return err;
+    return (yap_decl){
+        .kind = yap_decl_global_var,
+        .global_var = { .var_decl = st.var_decl, .is_bind = false },
+    };
+}
+
 yap_decl yap_build_decl(yap_source* src, yap_decl_node* node){
     yap_decl res = { .kind = yap_decl_error };
 
@@ -398,6 +442,9 @@ yap_decl yap_build_decl(yap_source* src, yap_decl_node* node){
             break;
         case yap_decl_file_import:
         case yap_decl_module_decl:
+            break;
+        case yap_decl_global_var:
+            res = yap_build_global_var(src, &node->global_var);
             break;
         case yap_decl_macro: {
             yap_expr macro_result = yap_build_macro_expr(src, &node->macro_call);
@@ -1980,7 +2027,7 @@ yap_expr yap_build_var_access_expr(yap_source* src, yap_identifier_node* ident){
     yap_module* cur_mod = yap_source_owning_module(ctx, src);
     if (cur_mod && cur_mod->prefix[0]
         && cur_mod->scope
-        && yap_scope_get_var(cur_mod->scope, ident->value)
+        && yap_scope_get_var(cur_mod->scope, ident->value) == var
         && strcmp(ident->value, "main") != 0) {
         emit_name = yap_ctx_strus_newf(ctx, "%s%s", cur_mod->prefix, var->name);
     }
