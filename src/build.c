@@ -1822,6 +1822,42 @@ static yap_expr yap_build_fn_blueprint(yap_source* src, yap_func_literal_node* f
  *  Expressions
  * ---------------------------------------------------------------- */
 
+/* '#name' / '#mod->name': resolved here, in the file that writes it, then handed to comptime
+ * as a fixed C name + type, so the macro's output never depends on the caller's scope. */
+static yap_expr yap_build_resolved_ref(yap_source* src, yap_expr_node* node){
+    yap_ctx* ctx = src->ctx;
+    yap_expr_node* inner = node->paren.expr;
+    if (!inner) return (yap_expr){ .kind = yap_expr_error };
+
+    if (inner->kind == yap_expr_var && inner->var.value){
+        yap_module* own = yap_source_owning_module(ctx, src);
+        for (yap_scope* sc = yap_ctx_current_scope(ctx); sc; sc = sc->parent){
+            if (!yap_scope_get_var(sc, inner->var.value)) continue;
+            if (sc != ctx->global_scope && !(own && sc == own->scope)){
+                yap_build_push_error(src, node->loc,
+                    "'#%s' names a local variable, which won't exist where the generated code goes",
+                    inner->var.value);
+                return (yap_expr){ .kind = yap_expr_error };
+            }
+            break;
+        }
+    }
+
+    yap_expr target = yap_build_expr(src, inner);
+    if (target.kind == yap_expr_error) return target;
+    if (target.kind != yap_expr_var || !target.var_name){
+        yap_build_push_error(src, node->loc, "'#' must be followed by a name or 'module->name'");
+        return (yap_expr){ .kind = yap_expr_error };
+    }
+
+    yap_expr_node args[2] = {
+        bp_cstr_node(src, target.var_name, node->loc),
+        bp_int_node(src, (long)target.type, node->loc),
+    };
+    yap_expr_node call = bp_yapi_call(src, "__resolved_ref", args, 2, node->loc);
+    return yap_build_expr(src, &call);
+}
+
 yap_expr yap_build_expr(yap_source* src, yap_expr_node* node){
     yap_expr ret = { .kind = yap_expr_error };
 
@@ -1844,6 +1880,7 @@ yap_expr yap_build_expr(yap_source* src, yap_expr_node* node){
         case yap_expr_index_access:  ret = yap_build_index_access_expr(src, &node->index_access);  break;
         case yap_expr_block:         ret = yap_build_block_expr(src, &node->block);                break;
         case yap_expr_module_access: ret = yap_build_module_access_expr(src, &node->module_access); break;
+        case yap_expr_resolved_ref: ret = yap_build_resolved_ref(src, node); break;
         case yap_expr_macro:         ret = yap_build_macro_expr(src, &node->macro_call); break;
         case yap_expr_blueprint:     ret = yap_build_blueprint_expr(src, &node->blueprint); break;
         case yap_expr_type_blueprint: ret = yap_build_type_blueprint(src, &node->type_blueprint); break;
