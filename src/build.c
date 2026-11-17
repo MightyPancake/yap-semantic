@@ -45,6 +45,15 @@ static yap_module* yap_source_owning_module(yap_ctx* ctx, yap_source* src){
     return yap_ctx_current_module(ctx);
 }
 
+static bool yap_is_null_literal(yap_expr e){
+    return e.kind == yap_expr_literal && e.literal.kind == yap_literal_null;
+}
+
+static bool yap_is_ptr_type(yap_ctx* ctx, yap_type_id id){
+    yap_type* t = yap_ctx_get_type(ctx, id);
+    return t && t->kind == yap_type_ptr;
+}
+
 static const char* yap_source_display_name(yap_source* src){
     if (!src) return "(unknown)";
     if (src->label && src->label[0]) return src->label;
@@ -1131,7 +1140,9 @@ yap_statement yap_build_return_statement(yap_source* src, yap_return_statement_n
     yap_type_id want = ctx->build_ret_type;
     if (want){
         yap_type* val_t = yap_ctx_get_type(ctx, val.type);
-        if (val_t && val_t->kind == yap_type_blob){
+        if (yap_is_null_literal(val) && yap_is_ptr_type(ctx, want)){
+            val.type = want;
+        } else if (val_t && val_t->kind == yap_type_blob){
             val = yap_build_blob_cast(src, val, want, rnode->loc);
             if (val.kind == yap_expr_error)
                 return (yap_statement){ .kind = yap_statement_error };
@@ -2179,6 +2190,11 @@ yap_expr yap_build_bin_expr(yap_source* src, yap_bin_op_node* bin){
     }
 
     yap_type_id common = yap_ctx_find_common_type(ctx, left.type, right.type);
+    // 'p == null' / 'p != null': null takes the pointer's type.
+    if ((bin->op == 'e' || bin->op == 'n') && common == ctx->internal_error_type_id){
+        if (yap_is_null_literal(right) && yap_is_ptr_type(ctx, left.type)) common = left.type;
+        else if (yap_is_null_literal(left) && yap_is_ptr_type(ctx, right.type)) common = right.type;
+    }
     if (common == ctx->internal_error_type_id){
         yap_build_push_error(src, bin->loc, "Incompatible types in binary expression");
         return (yap_expr){ .kind = yap_expr_error };
@@ -2565,7 +2581,9 @@ yap_expr yap_build_func_call_expr(yap_source* src, yap_func_call_node* call){
 
         yap_type_id expected = expected_args[target_idx];
         yap_type* pe_type = yap_ctx_get_type(ctx, pe.type);
-        if (pe_type && pe_type->kind == yap_type_blob){
+        if (yap_is_null_literal(pe) && yap_is_ptr_type(ctx, expected)){
+            pe.type = expected;
+        } else if (pe_type && pe_type->kind == yap_type_blob){
             pe = yap_build_blob_cast(src, pe, expected, call->loc);
             if (pe.kind == yap_expr_error)
                 return (yap_expr){ .kind = yap_expr_error };
