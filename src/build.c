@@ -522,21 +522,21 @@ yap_decl yap_build_fn_def(yap_source* src, yap_func_decl_node* fnode){
         darr_push(args, yap_build_func_arg(src, &arg_node));
     }
 
-    /* The C backend always calls main as (int argc, char** argv) and binds both into a single declared yap-level parameter, so that parameter must be exactly 'byte@[]'. */
+    /* The C backend always calls main as (int argc, char** argv) and binds both into a single declared yap-level parameter, so that parameter must be exactly 'u8@[]'. */
     if (strcmp(emit_name, "main") == 0){
         if (darr_len(args) > 1){
             yap_build_push_error(src, fnode->loc,
-                "'main' must take either no arguments or a single 'byte@[]' argument");
+                "'main' must take either no arguments or a single 'u8@[]' argument");
             return (yap_decl){ .kind = yap_decl_error };
         }
         if (darr_len(args) == 1){
             yap_func_arg arg0 = args[0];
-            yap_type_id byte_id = yap_ctx_get_type_id_by_name(ctx, "byte");
+            yap_type_id byte_id = yap_ctx_get_type_id_by_name(ctx, "u8");
             yap_type_id expected = yap_ctx_get_slice_of_type_id(ctx,
                 yap_ctx_get_pointer_of_type_id(ctx, byte_id));
             if (arg0.kind != yap_func_arg_valid || arg0.type != expected){
                 yap_build_push_error(src, fnode->loc,
-                    "'main' argument must have type 'byte@[]'");
+                    "'main' argument must have type 'u8@[]'");
                 return (yap_decl){ .kind = yap_decl_error };
             }
         }
@@ -2004,14 +2004,14 @@ yap_expr yap_build_literal_expr(yap_source* src, yap_literal_node* lit){
             break;
         }
         case yap_literal_string: {
-            yap_type_id byte_id = yap_ctx_get_type_id_by_name(ctx, "byte");
+            yap_type_id byte_id = yap_ctx_get_type_id_by_name(ctx, "u8");
             yap_type slice_t = { .kind = yap_type_slice, .slice = { .element_type = byte_id }, .is_const = false };
             res.type = yap_ctx_insert_type_if_not_exists(ctx, slice_t);
             res.literal = (yap_literal){ .kind = yap_literal_string, .text_len = lit->string.value_len, .text = lit->string.value };
             break;
         }
         case yap_literal_cstring: {
-            yap_type_id byte_id = yap_ctx_get_type_id_by_name(ctx, "byte");
+            yap_type_id byte_id = yap_ctx_get_type_id_by_name(ctx, "u8");
             res.type = yap_ctx_get_pointer_of_type_id(ctx, byte_id);
             res.literal = (yap_literal){ .kind = yap_literal_cstring, .text_len = lit->string.value_len, .text = lit->string.value };
             break;
@@ -3381,7 +3381,7 @@ static bool yap_macro_arg_fits(yap_ctx* ctx, yap_macro_arg_shape shape, yap_type
                 && !yap_is_primitive_named(ctx, want, "bool") && !yap_is_comptime_handle(ctx, want);
         case yap_macro_arg_float:   return pointee && yap_is_primitive_named(ctx, pointee, "f64");
         case yap_macro_arg_string:
-        case yap_macro_arg_cstring: return pointee && yap_is_primitive_named(ctx, pointee, "byte");
+        case yap_macro_arg_cstring: return pointee && yap_is_primitive_named(ctx, pointee, "u8");
         case yap_macro_arg_bool:    return yap_is_primitive_named(ctx, want, "bool");
         case yap_macro_arg_list:    return yap_is_yexprlist_ptr(ctx, want);
         case yap_macro_arg_expr:    return want == ctx->yexpr_type_id;
